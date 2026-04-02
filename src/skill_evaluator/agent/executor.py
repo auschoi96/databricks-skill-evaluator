@@ -417,7 +417,7 @@ def _get_mlflow_stop_hook(
                     os.environ[key] = value
 
             # Configure MLflow at hook creation time (matches builder app pattern).
-            from ..core.config import SkillTestConfig
+            from ..core.config import EvaluatorConfig as SkillTestConfig
 
             agent_experiment = mlflow_experiment or os.environ.get(
                 "SKILL_TEST_MLFLOW_EXPERIMENT",
