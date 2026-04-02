@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "databricks-skill-evaluator"
+version = "0.1.0"
+description = "Evaluate and optimize Claude Code skills against real Databricks workspaces"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+    "mlflow[databricks]>=3.10.1",
+    "click>=8.0",
+    "rich>=13.0",
+    "python-dotenv>=1.0.0",
+    "databricks-sdk>=0.20.0",
+    "protobuf>=5.26",
+    "claude-agent-sdk>=0.1.39",
+    "litellm<=1.82.6",
+    "anthropic>=0.40.0",
+    "gepa>=0.1.0",
+    "tiktoken>=0.7.0",
+]
+
+[project.scripts]
+dse = "skill_evaluator.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skill_evaluator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
