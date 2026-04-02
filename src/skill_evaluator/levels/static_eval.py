@@ -98,9 +98,9 @@ _STATIC_EVAL_PROMPT = """You are evaluating a Claude Code skill file for quality
 ## Evaluation Dimensions
 
 For each dimension below, provide:
-- **score**: 1-5 (1=very poor, 3=acceptable, 5=excellent)
-- **evidence**: Specific quote or observation from the skill
-- **recommendation**: Actionable improvement suggestion (if score < 4)
+- **score**: 1-10 (1=critically broken, 5=mediocre, 7=good, 10=excellent)
+- **evidence**: Specific quote or observation from the skill (include line references where possible)
+- **recommendation**: Actionable improvement suggestion (if score < 7). Be specific — reference the exact section, line, or instruction that needs to change.
 
 ### Dimensions to Evaluate:
 
@@ -126,8 +126,8 @@ Return a JSON array with exactly 8 objects (dimensions 1-6 and 7-8, skipping too
 
 ```json
 [
-  {{"dimension": "self_contained", "score": 4, "evidence": "...", "recommendation": "..."}},
-  {{"dimension": "no_conflicts", "score": 5, "evidence": "No contradictions found", "recommendation": null}},
+  {{"dimension": "self_contained", "score": 8, "evidence": "...", "recommendation": "..."}},
+  {{"dimension": "no_conflicts", "score": 9, "evidence": "No contradictions found", "recommendation": null}},
   ...
 ]
 ```"""
@@ -171,11 +171,23 @@ class StaticEvalLevel(EvalLevel):
         feedbacks.extend(llm_feedbacks)
         dimension_scores.update(llm_scores)
 
-        # Compute overall score (average of all dimensions, normalized to 0-1)
+        # Collect recommendations from all feedbacks
+        recommendations = []
+        for f in feedbacks:
+            rationale = f.get("rationale", "")
+            if "Recommendation:" in rationale:
+                rec = rationale.split("Recommendation:")[-1].strip()
+                if rec and rec != "None":
+                    recommendations.append(rec)
+            elif f.get("value") == "fail" and f.get("source") == "CODE":
+                recommendations.append(f"{f.get('name', '')}: {rationale}")
+
+        # Compute overall score (average of all dimensions on 1-10 scale, normalized to 0-1)
         if dimension_scores:
-            raw_avg = sum(dimension_scores.values()) / len(dimension_scores)
-            score = raw_avg / 5.0  # Normalize from 1-5 to 0-1
+            overall_score_raw = sum(dimension_scores.values()) / len(dimension_scores)
+            score = overall_score_raw / 10.0  # Normalize from 1-10 to 0-1
         else:
+            overall_score_raw = 0.0
             score = 0.0
 
         return LevelResult(
@@ -183,7 +195,9 @@ class StaticEvalLevel(EvalLevel):
             score=score,
             feedbacks=feedbacks,
             metadata={
-                "dimension_scores": dimension_scores,
+                "overall_score": round(overall_score_raw, 1),
+                "criteria": dimension_scores,
+                "recommendations": recommendations,
                 "dimensions_evaluated": len(dimension_scores),
             },
         )
@@ -193,7 +207,7 @@ class StaticEvalLevel(EvalLevel):
         feedbacks = []
         if not config.mcp_config or not config.mcp_config.available_tools:
             # Can't verify — give neutral score
-            return 3.0, [{
+            return 5.0, [{
                 "name": "static/tool_accuracy",
                 "value": "skip",
                 "rationale": "No MCP tools available for verification",
@@ -214,9 +228,9 @@ class StaticEvalLevel(EvalLevel):
             })
 
         if not referenced:
-            return 5.0, feedbacks
+            return 10.0, feedbacks
 
-        score = (len(referenced) - len(missing)) / len(referenced) * 5.0
+        score = (len(referenced) - len(missing)) / len(referenced) * 10.0
         return max(1.0, score), feedbacks
 
     def _check_examples_valid(self, config: LevelConfig) -> tuple[float, list[dict]]:
@@ -247,7 +261,7 @@ class StaticEvalLevel(EvalLevel):
                     if result["valid"]:
                         passed += 1
 
-        score = (passed / total * 5.0) if total > 0 else 5.0
+        score = (passed / total * 10.0) if total > 0 else 10.0
         return max(1.0, score), feedbacks
 
     def _check_security_deterministic(self, config: LevelConfig) -> list[dict]:
@@ -350,8 +364,8 @@ class StaticEvalLevel(EvalLevel):
             scores[dim_id] = float(dim_score)
             feedbacks.append({
                 "name": f"static/{dim_id}",
-                "value": "pass" if dim_score >= 3 else "fail",
-                "rationale": f"Score: {dim_score}/5. {evidence}"
+                "value": "pass" if dim_score >= 6 else "fail",
+                "rationale": f"Score: {dim_score}/10. {evidence}"
                 + (f" Recommendation: {recommendation}" if recommendation else ""),
                 "source": "LLM_JUDGE",
             })

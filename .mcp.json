@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "skill-evaluator": {
+      "command": "python",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/run_server.py"]
+    }
+  }
+}

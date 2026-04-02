@@ -18,13 +18,22 @@ This framework answers those questions with a 5-level testing pyramid:
 
 L1 and L3 run in seconds with zero agent cost. L2/L4/L5 run real Claude Code agents and compare behavior with and without the skill.
 
+## Two Modes
+
+| Mode | Interface | Best For |
+|------|-----------|----------|
+| **CLI** | `dse evaluate ./my-skill` | CI/CD, batch evaluation, scripting |
+| **MCP Tools + Skill** | Claude calls `run_static_eval`, etc. | Interactive Claude Code sessions |
+
+Both modes use the same underlying evaluation levels and produce the same results.
+
 ## Install
 
 ```bash
 pip install databricks-skill-evaluator
 ```
 
-## Quick Start
+## Quick Start — CLI Mode
 
 ```bash
 # 1. Authenticate with your Databricks workspace
@@ -47,6 +56,49 @@ dse evaluate ./my-skill --levels all --mcp-json .mcp.json  # Full (minutes)
 # 6. Optimize based on results
 dse optimize ./my-skill --feedback eval/feedback.json --preset quick
 ```
+
+## Quick Start — MCP Mode (Claude Code Skill)
+
+Add the skill-evaluator MCP server to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "skill-evaluator": {
+      "command": "python",
+      "args": ["/path/to/databricks-skill-evaluator/run_server.py"]
+    },
+    "databricks": {
+      "command": "python",
+      "args": ["/path/to/databricks-mcp-server/run_server.py"]
+    }
+  }
+}
+```
+
+Then install the `SKILL.md` as a Claude Code skill. Claude will automatically:
+1. Call `discover_skill` to parse your skill directory
+2. Call `run_unit_tests` and `run_static_eval` for quick feedback
+3. Show you per-criteria scores (1-10) and recommendations
+4. Offer to run agent-based levels (L2/L4/L5) for deeper analysis
+5. Call `generate_report` to create an HTML report
+
+### Available MCP Tools
+
+| Tool | Purpose |
+|------|---------|
+| `authenticate_workspace` | Connect to Databricks |
+| `discover_skill` | Parse a skill directory |
+| `init_eval_config` | Scaffold eval/ templates |
+| `run_unit_tests` | L1: Code syntax validation |
+| `run_static_eval` | L3: SKILL.md quality (10 criteria, 1-10 scale) |
+| `run_integration_tests` | L2: Real agent against Databricks |
+| `run_thinking_eval` | L4: Agent reasoning quality |
+| `run_output_eval` | L5: WITH/WITHOUT comparison |
+| `generate_report` | HTML report from results |
+| `run_optimization` | GEPA optimization (future) |
+
+---
 
 ## What You Provide
 
