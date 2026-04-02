@@ -232,18 +232,24 @@ The LLM judge uses these to calibrate what "good reasoning" means for this parti
 
 ## Level 5: Output Eval
 
-**File**: `levels/output_eval.py` (203 lines)
+**File**: `levels/output_eval.py`
 **Requires agent + workspace + MCP tools. The core controlled experiment.**
 
-### WITH vs WITHOUT comparison
+L5 evaluates across **three dimensions** — not just what the agent said, but what it actually built:
 
-For each test case:
-1. Run agent **WITH** the skill (SKILL.md injected as system prompt)
-2. Run agent **WITHOUT** the skill (same prompt, no skill — the control)
-3. Grade both responses using the semantic grader
-4. Classify each assertion by comparing WITH vs WITHOUT results
+### 5-phase evaluation pipeline
 
-### Classification labels
+```
+Phase 1: Run agent WITH skill
+Phase 2: Run agent WITHOUT skill (cached baseline)
+Phase 3: Response text grading ─── WITH vs WITHOUT semantic comparison
+Phase 4: Asset verification ────── Did it actually create the resources?
+Phase 5: Source of truth comparison ─ Do created assets match expectations?
+```
+
+### Phase 3: Response text grading (WITH vs WITHOUT)
+
+The same controlled experiment as before — grade both responses, classify each assertion:
 
 | Label | WITH | WITHOUT | Meaning |
 |-------|------|---------|---------|
@@ -251,6 +257,71 @@ For each test case:
 | **REGRESSION** | fail | pass | Skill confused the agent — it was better without |
 | **NEEDS_SKILL** | fail | fail | Neither response handles this — skill must add content |
 | **NEUTRAL** | pass | pass | Agent already knows this — skill adds no value here |
+
+### Phase 4: Asset verification (new)
+
+Evaluating the response text alone isn't enough. A skill like `databricks-genie` should be verified by checking that the Genie Space was **actually created**, has the **right tables**, and includes **sample questions** — not just that the agent's text mentions these things.
+
+The asset verification phase inspects the agent's execution trace:
+
+**Check 1 — Tool call success**: Every MCP tool call should have succeeded. If `create_or_update_genie` returned an error, the asset wasn't created regardless of what the response text says.
+
+**Check 2 — Resource ID returned**: For creation tools (`create_or_update_genie`, `create_or_update_dashboard`, etc.), verify the result contains a resource ID (`space_id`, `dashboard_id`, etc.).
+
+**Check 3 — Tool input parameters**: Verify the agent passed the correct parameters. Defined in `ground_truth.yaml` under `expectations.asset_verification.expected_tool_params`:
+
+```yaml
+asset_verification:
+  expected_tool_params:
+    mcp__databricks__create_or_update_genie:
+      display_name: "Sales Analytics"
+      table_identifiers: ["ac_demo.dc_assistant.customers"]
+      sample_questions: "*"          # wildcard: just check param exists
+```
+
+Parameter matching supports:
+- **Exact match**: `display_name: "Sales Analytics"` — value must match
+- **List containment**: `table_identifiers: ["table_a", "table_b"]` — all items must be present
+- **Wildcard**: `sample_questions: "*"` — parameter must exist, any value accepted
+
+**Check 4 — LLM asset assertions**: Freeform assertions evaluated by an LLM judge that reads the tool call log:
+
+```yaml
+asset_verification:
+  assertions:
+    - "The create_or_update_genie tool returned a space_id in its result"
+    - "The tool was called with at least one sample question about customer demographics"
+```
+
+The LLM receives the full tool call trace (inputs + results) and evaluates each assertion against what actually happened.
+
+### Phase 5: Source of truth comparison
+
+If `eval/source_of_truth/` files exist and the test case references them:
+
+```yaml
+expectations:
+  source_of_truth:
+    file: expected_genie_space.json
+    mandatory_facts:
+      - "ac_demo.dc_assistant.customers"
+      - "sample_questions"
+```
+
+The comparison checks mandatory facts against the agent's response + tool results, then uses an LLM to score structural match, content accuracy, and completeness (each on 1-10).
+
+### Task scoring
+
+Each test case's score is a weighted combination:
+
+| Weight | Dimension | Condition |
+|--------|-----------|-----------|
+| 50% | Response text score | Always present |
+| 30% | Asset verification pass rate | If `asset_verification` defined |
+| 20% | Source of truth score | If `source_of_truth` defined |
+
+If only response + assets (no SoT): 60% response, 40% assets.
+If only response (no assets, no SoT): 100% response.
 
 ### Baseline caching
 
@@ -313,10 +384,21 @@ Each fallback model gets 3 retries. If all exhausted: returns score 0.0.
 
 ## Scoring Formulas
 
-### L5 Output Eval — composite score
+### L5 Output Eval — per-task score
+
+Each test case is scored across three dimensions (when all are present):
+
+```
+task_score = 0.50 * response_score + 0.30 * asset_pass_rate + 0.20 * sot_score
+```
+
+If no source of truth defined: `0.60 * response + 0.40 * assets`.
+If no asset verification defined: `1.0 * response`.
+
+### L5 Response score (Phase 3) — semantic grader formula
 
 ```python
-final = max(0.0, min(1.0,
+response_score = max(0.0, min(1.0,
     0.40 * effectiveness_delta      # pass_rate_with - pass_rate_without
   + 0.30 * pass_rate_with           # absolute quality of WITH-skill response
   + 0.15 * token_efficiency         # smaller skills get bonus (up to 1.15x)
@@ -501,6 +583,20 @@ test_cases:
         banned_tools: [Bash]
         tool_limits: {Bash: 3}
         token_budget: {max_total: 100000}
+      asset_verification:              # L5: verify created resources (Phase 4)
+        expected_tool_params:           # Check tool inputs
+          mcp__databricks__create_or_update_genie:
+            display_name: "Sales Analytics"
+            table_identifiers: ["catalog.schema.table"]
+            sample_questions: "*"       # wildcard: param must exist, any value
+        assertions:                     # Freeform checks on tool results (LLM-evaluated)
+          - "The tool returned a space_id confirming creation"
+          - "Sample questions reference actual column names"
+      source_of_truth:                 # L5: compare against expected output (Phase 5)
+        file: expected_output.json      # File in eval/source_of_truth/
+        mandatory_facts:                # Must appear in agent output + tool results
+          - "catalog.schema.table"
+          - "sample_questions"
     metadata:
       category: happy_path             # For stratified splitting
       difficulty: easy
