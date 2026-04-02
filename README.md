@@ -255,35 +255,100 @@ Key flags for `dse evaluate`:
 
 ## Architecture
 
+Two entry points — same evaluation levels underneath.
+
 ```
-                    ┌─────────────────────────────┐
-                    │         dse CLI              │
-                    │  auth | init | evaluate | optimize
-                    └──────────┬──────────────────┘
-                               │
-                    ┌──────────▼──────────────────┐
-                    │       Orchestrator           │
-                    │  Runs levels, logs MLflow,   │
-                    │  generates reports           │
-                    └──────────┬──────────────────┘
-                               │
-          ┌────────┬───────────┼───────────┬────────┐
-          ▼        ▼           ▼           ▼        ▼
-       L1 Unit  L2 Integ   L3 Static  L4 Think  L5 Output
-       (syntax) (e2e)      (LLM judge)(traces)  (WITH/WITHOUT)
-          │        │           │           │        │
-          └────────┴───────────┴───────────┴────────┘
-                               │
-                    ┌──────────▼──────────────────┐
-                    │      Shared Infrastructure   │
-                    │  Semantic Grader | Agent SDK  │
-                    │  MLflow Tracing | Scorers     │
-                    └─────────────────────────────┘
+  CLI Mode                              MCP Mode (Claude Code)
+  ────────                              ──────────────────────
+  dse auth|init|evaluate|optimize       Claude + SKILL.md
+          │                                     │
+          ▼                                     ▼
+    Orchestrator                          FastMCP Server
+    (runs all levels                      (10 tools, Claude
+     sequentially)                         calls individually)
+          │                                     │
+          └──────────────┬──────────────────────┘
+                         │
+          ┌──────────────▼──────────────────────┐
+          │         5 Evaluation Levels          │
+          │                                      │
+          │  L1 Unit ─── syntax, links, YAML     │
+          │  L2 Integration ── agent + workspace  │
+          │  L3 Static ── LLM judge (1-10 scale) │
+          │  L4 Thinking ── agent trace quality   │
+          │  L5 Output ── WITH/WITHOUT compare    │
+          └──────────────┬──────────────────────┘
+                         │
+          ┌──────────────▼──────────────────────┐
+          │       Shared Infrastructure          │
+          │                                      │
+          │  Semantic Grader (3-phase hybrid)     │
+          │  Claude Agent SDK (executor.py)       │
+          │  Deterministic Scorers (syntax, trace)│
+          │  LLM Backend (model fallback chain)   │
+          │  MLflow Tracing + Assessment APIs     │
+          │  HTML Report Generator                │
+          └─────────────────────────────────────┘
+```
+
+## Project Structure
+
+```
+databricks-skill-evaluator/
+  SKILL.md                     # Claude Code skill (teaches evaluation workflow)
+  .mcp.json                    # MCP server config
+  run_server.py                # MCP server entry point
+  pyproject.toml               # pip install, dse + dse-server entry points
+  README.md                    # This file
+  TECHNICAL.md                 # Deep dive into internals
+  example.md                   # End-to-end walkthrough with databricks-genie
+  src/skill_evaluator/
+    server.py                  # FastMCP server — 10 MCP tools
+    cli.py                     # Click CLI — dse command
+    orchestrator.py            # Suite runner (CLI mode)
+    auth.py                    # Databricks auth + ~/.dse/config.yaml
+    skill_discovery.py         # Parse SKILL.md frontmatter + references
+    mcp_resolver.py            # Resolve .mcp.json for agent execution
+    test_instructions.py       # Load eval/ config (ground_truth, instructions)
+    core/
+      config.py                # EvaluatorConfig, QualityGates, MLflowConfig
+      dataset.py               # EvalRecord, YAMLDatasetSource
+      trace_models.py          # TraceMetrics, ToolCall, FileOperation
+    levels/
+      base.py                  # EvalLevel ABC, LevelConfig, LevelResult
+      unit_tests.py            # L1: code block syntax validation
+      integration_tests.py     # L2: real agent + Databricks workspace
+      static_eval.py           # L3: LLM judge, 10 criteria, 1-10 scale
+      thinking_eval.py         # L4: agent reasoning quality
+      output_eval.py           # L5: WITH/WITHOUT comparison
+      agent_evaluator.py       # Agent execution wrapper for GEPA
+    grading/
+      semantic_grader.py       # 3-phase grading (deterministic → agent → LLM)
+      llm_backend.py           # completion_with_fallback, model fallback chain
+    scorers/
+      deterministic.py         # python_syntax, sql_syntax, pattern_adherence
+      trace.py                 # tool_count, required_tools, banned_tools
+      llm_judges.py            # LLM-based dynamic scorers
+    optimize/
+      config.py                # GEPA presets (minimal/quick/standard/thorough)
+      feedback.py              # Human feedback → GEPA background
+      splitter.py              # Train/val dataset splitting
+      utils.py                 # Token counting, path resolution
+    reporting/
+      html_report.py           # Self-contained HTML report generator
+    criteria/
+      eval_criteria.py         # SkillSet/Skill parsing for eval rubrics
+      builtin/                 # Shipped evaluation criteria
+        general-quality/       # Response quality rubric
+        sql-correctness/       # SQL best practices rubric
+        tool-selection/        # MCP tool preference rubric
 ```
 
 ## Full Walkthrough
 
 See [example.md](example.md) for a complete step-by-step walkthrough using the `databricks-genie` skill.
+
+See [TECHNICAL.md](TECHNICAL.md) for implementation details — how each level works internally, the semantic grading pipeline, scoring formulas, and MLflow integration.
 
 ## License
 
