@@ -32,6 +32,8 @@ Verify with `dse --help`. For agent-based levels (L2/L4/L5), a Databricks worksp
 | "Run integration tests" / "Run L2" | Phase 0 then skip to L2 in Phase 3 |
 | "Optimize my skill" / "Improve my SKILL.md" | Phase 4 refinement loop |
 
+Always ask the user what skill they want to evaluate if it is not immediately clear. 
+
 If the request doesn't clearly match, run through Phase 2 (quick eval). Ask the user if they want to continue to agent-based levels.
 
 ---

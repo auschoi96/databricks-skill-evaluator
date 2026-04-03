@@ -110,10 +110,11 @@ def _build_trace_metrics(
             metrics.start_time = ts
 
         if event.type == "tool_use":
+            _raw_input = event.data.get("input", {})
             tc = ToolCall(
                 id=event.data.get("id", str(uuid.uuid4())),
                 name=event.data.get("name", "unknown"),
-                input=event.data.get("input", {}),
+                input=_raw_input if isinstance(_raw_input, dict) else {},
                 timestamp=ts,
             )
             tool_calls_by_id[tc.id] = tc
