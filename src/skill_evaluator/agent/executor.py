@@ -211,10 +211,15 @@ def _load_mcp_config(project_root: Path | None = None) -> dict[str, Any]:
             if key == "defer_loading":
                 continue  # Not relevant for agent SDK
             if isinstance(val, str):
-                resolved_cfg[key] = val.replace("${CLAUDE_PLUGIN_ROOT}", str(repo_root))
+                resolved_cfg[key] = (
+                    val.replace("${CLAUDE_PLUGIN_ROOT}", str(repo_root))
+                       .replace("${CLAUDE_PROJECT_ROOT}", str(repo_root))
+                )
             elif isinstance(val, list):
                 resolved_cfg[key] = [
-                    v.replace("${CLAUDE_PLUGIN_ROOT}", str(repo_root)) if isinstance(v, str) else v for v in val
+                    v.replace("${CLAUDE_PLUGIN_ROOT}", str(repo_root))
+                     .replace("${CLAUDE_PROJECT_ROOT}", str(repo_root))
+                    if isinstance(v, str) else v for v in val
                 ]
             else:
                 resolved_cfg[key] = val
@@ -487,15 +492,16 @@ def _get_mlflow_stop_hook(
         """Upload transcript to MLflow in the background (best-effort).
 
         Judges are field-based and don't consume MLflow traces, so this is
-        purely for observability logging.  Disabled by default because the
-        MlflowV3SpanExporter tries to upload trace artifacts to S3 via
-        presigned URLs, which fail with 403 when the experiment's
-        artifact_location is under .jobs/ DBFS.
+        purely for observability logging.  Enabled by default.  The parent
+        process disables the MlflowV3SpanExporter (mlflow.tracing.disable)
+        to avoid S3 presigned-URL 403 errors; the exporter logger is also
+        suppressed during process_transcript() so any residual failures are
+        silent.
 
-        Set SKILL_TEST_UPLOAD_TRACES=true to enable.
+        Set SKILL_TEST_UPLOAD_TRACES=false to disable.
         """
-        if not os.environ.get("SKILL_TEST_UPLOAD_TRACES", "").lower() in ("1", "true", "yes"):
-            logger.debug("Trace upload skipped (set SKILL_TEST_UPLOAD_TRACES=true to enable)")
+        if os.environ.get("SKILL_TEST_UPLOAD_TRACES", "").lower() in ("0", "false", "no"):
+            logger.debug("Trace upload disabled (SKILL_TEST_UPLOAD_TRACES=false)")
             return
 
         # Suppress the mlflow_v3 exporter warnings -- if the S3 presigned

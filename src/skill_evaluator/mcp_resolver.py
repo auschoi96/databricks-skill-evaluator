@@ -155,8 +155,9 @@ def _resolve_string(value: str, base_dir: Path) -> str:
             return os.environ.get(var_name, default)
         return os.environ.get(var_expr, match.group(0))
 
-    # Replace ${CLAUDE_PLUGIN_ROOT} with base_dir
+    # Replace Claude Code project variables with base_dir
     value = value.replace("${CLAUDE_PLUGIN_ROOT}", str(base_dir))
+    value = value.replace("${CLAUDE_PROJECT_ROOT}", str(base_dir))
 
     # Replace ${VAR} and ${VAR:-default}
     return re.sub(r"\$\{([^}]+)\}", replacer, value)
@@ -221,13 +222,19 @@ def _find_server_module(entry_tree: ast.AST, entry_dir: Path) -> Path | None:
             if candidate.exists():
                 return candidate
             # Try as package: databricks_mcp_server/server.py
-            for subdir in entry_dir.iterdir():
-                if subdir.is_dir():
-                    candidate = subdir / "server.py"
-                    if candidate.exists():
-                        # Verify this module matches the import
-                        if parts[-1] == "server" and subdir.name == parts[0]:
-                            return candidate
+            # Search both entry_dir and entry_dir/src (for src-layout projects)
+            search_roots = [entry_dir]
+            src_dir = entry_dir / "src"
+            if src_dir.is_dir():
+                search_roots.append(src_dir)
+            for root in search_roots:
+                for subdir in root.iterdir():
+                    if subdir.is_dir():
+                        candidate = subdir / "server.py"
+                        if candidate.exists():
+                            # Verify this module matches the import
+                            if parts[-1] == "server" and subdir.name == parts[0]:
+                                return candidate
     return None
 
 

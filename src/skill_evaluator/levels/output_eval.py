@@ -220,12 +220,16 @@ class OutputEvalLevel(EvalLevel):
 
             final_score, score_breakdown = compute_score(diagnostics)
 
-            for assertion in with_assertions:
-                classification = assertion.get("classification", "NEUTRAL")
+            # Build classification lookup from diagnostics
+            classifications = diagnostics.get("classifications", [])
+            for i, assertion in enumerate(with_assertions):
+                classification = "NEUTRAL"
+                if i < len(classifications):
+                    classification = classifications[i].get("classification", "NEUTRAL")
                 feedbacks.append({
-                    "name": f"output/{case_id}/response/{assertion.get('text', 'unknown')[:50]}",
-                    "value": "pass" if assertion.get("passed") else "fail",
-                    "rationale": f"[{classification}] {assertion.get('evidence', '')}",
+                    "name": f"output/{case_id}/response/{assertion.text[:50]}",
+                    "value": "pass" if assertion.passed else "fail",
+                    "rationale": f"[{classification}] {assertion.evidence}",
                     "source": "LLM_JUDGE",
                 })
 
