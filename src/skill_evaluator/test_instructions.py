@@ -157,6 +157,33 @@ test_cases:
         required_tools: []
         banned_tools: []
         tool_limits: {{}}
+      asset_verification:
+        expected_tool_params: {{}}
+          # TODO: Add expected tool parameters, e.g.:
+          # mcp__databricks__create_or_update_genie:
+          #   display_name: "My Space"
+          #   table_identifiers: ["catalog.schema.table"]
+        assertions:
+          - "TODO: Add freeform asset assertions"
+        verify_live:
+          []
+          # TODO: Add live verification checks, e.g.:
+          # - resource_type: genie_space
+          #   extract_id_from: mcp__databricks__create_or_update_genie
+          #   id_field: space_id
+          #   checks:
+          #     - field: display_name
+          #       operator: contains
+          #       value: "My Space"
+          #     - field: table_identifiers
+          #       operator: length_gte
+          #       value: 1
+      source_of_truth:
+        file: ""
+          # TODO: Add filename from eval/source_of_truth/, e.g.:
+          # file: expected_output.json
+        mandatory_facts:
+          - "TODO: Add mandatory facts to verify in output"
     metadata:
       category: happy_path
       difficulty: easy

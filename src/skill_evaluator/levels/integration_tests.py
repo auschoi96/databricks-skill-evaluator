@@ -43,6 +43,7 @@ class IntegrationTestLevel(EvalLevel):
 
         feedbacks: list[dict[str, Any]] = []
         task_results: list[dict[str, Any]] = []
+        trace_ids: list[str] = []
 
         # Step 1: Test MCP connectivity
         logger.info("Testing MCP tool connectivity...")
@@ -79,6 +80,15 @@ class IntegrationTestLevel(EvalLevel):
             prompt = case.inputs.get("prompt", "")
             case_id = case.id
             logger.info(f"Integration test: {case_id}")
+
+            if not prompt or not prompt.strip():
+                feedbacks.append({
+                    "name": f"integration/{case_id}/execution",
+                    "value": "skip",
+                    "rationale": "Test case has empty or missing prompt",
+                    "source": "CODE",
+                })
+                continue
 
             start_time = time.time()
             try:
@@ -123,11 +133,16 @@ class IntegrationTestLevel(EvalLevel):
                 task_score = 1.0 if success else 0.0
                 all_scores.append(task_score)
 
+                # Capture MLflow trace ID for assessment logging
+                if result.mlflow_trace_id:
+                    trace_ids.append(result.mlflow_trace_id)
+
                 task_results.append({
                     "task_id": case_id,
                     "execution_time_s": execution_time,
                     "success": success,
                     "tool_calls": result.trace_metrics.total_tool_calls if result.trace_metrics else 0,
+                    "mlflow_trace_id": result.mlflow_trace_id,
                 })
 
             except Exception as e:
@@ -152,10 +167,11 @@ class IntegrationTestLevel(EvalLevel):
                 "num_integration_tests": len(integration_cases),
                 "success_rate": score,
             },
+            trace_ids=trace_ids,
         )
 
     def _test_mcp_connectivity(self, config: LevelConfig) -> list[dict[str, Any]]:
-        """Verify MCP servers can be reached."""
+        """Verify MCP servers have resolvable tools."""
         feedbacks = []
         if not config.mcp_config or not config.mcp_config.servers:
             feedbacks.append({
@@ -166,43 +182,42 @@ class IntegrationTestLevel(EvalLevel):
             })
             return feedbacks
 
+        # Ensure tools are resolved (already done in _build_level_config,
+        # but defensive in case of direct instantiation)
+        if not config.mcp_config.available_tools:
+            config.mcp_config.resolve_available_tools()
+
         for server_name in config.mcp_config.servers:
-            feedbacks.append({
-                "name": f"integration/mcp_connectivity/{server_name}",
-                "value": "pass",
-                "rationale": f"MCP server '{server_name}' configuration found",
-                "source": "CODE",
-            })
+            prefix = f"mcp__{server_name}__"
+            server_tools = [t for t in config.mcp_config.available_tools if t.startswith(prefix)]
+            if server_tools:
+                feedbacks.append({
+                    "name": f"integration/mcp_connectivity/{server_name}",
+                    "value": "pass",
+                    "rationale": f"MCP server '{server_name}' resolved {len(server_tools)} tools",
+                    "source": "CODE",
+                })
+            else:
+                feedbacks.append({
+                    "name": f"integration/mcp_connectivity/{server_name}",
+                    "value": "fail",
+                    "rationale": f"MCP server '{server_name}' has no resolvable tools (entry point missing or invalid)",
+                    "source": "CODE",
+                })
 
         return feedbacks
 
     def _check_trace_expectations(self, case, result) -> list[dict[str, Any]]:
         """Check trace-based expectations from ground_truth."""
-        feedbacks = []
+        from .shared_validators import check_trace_expectations
+
         trace = result.trace_metrics
         if not trace:
-            return feedbacks
+            return []
 
-        expectations = (case.expectations or {}).get("trace_expectations", {})
-
-        # Required tools
-        for tool in expectations.get("required_tools", []):
-            found = trace.has_tool(tool)
-            feedbacks.append({
-                "name": f"integration/{case.id}/required_tool/{tool}",
-                "value": "pass" if found else "fail",
-                "rationale": f"Required tool '{tool}' {'used' if found else 'NOT used'}",
-                "source": "CODE",
-            })
-
-        # Banned tools
-        for tool in expectations.get("banned_tools", []):
-            used = trace.has_tool(tool)
-            feedbacks.append({
-                "name": f"integration/{case.id}/banned_tool/{tool}",
-                "value": "pass" if not used else "fail",
-                "rationale": f"Banned tool '{tool}' {'NOT used' if not used else 'was USED'}",
-                "source": "CODE",
-            })
-
-        return feedbacks
+        return check_trace_expectations(
+            case_id=case.id,
+            trace=trace,
+            expectations=case.expectations or {},
+            level_prefix="integration",
+        )

@@ -131,6 +131,9 @@ def run_evaluation_suite(config: EvaluationSuiteConfig) -> EvaluationSuiteResult
         logger.info(f"Running Level {level.level_number}: {level.name.upper()}")
         logger.info(f"{'='*60}")
 
+        # Pass prior level results so subsequent levels can reuse them
+        level_config.prior_results = dict(result.level_results)
+
         level_start = time.time()
         try:
             level_result = level.run(level_config)
@@ -159,6 +162,9 @@ def run_evaluation_suite(config: EvaluationSuiteConfig) -> EvaluationSuiteResult
 
         # Log to MLflow
         _log_level_to_mlflow(level_name, level_result)
+
+        # Log feedbacks as MLflow assessments on traces
+        _log_feedbacks_to_trace(level_name, level_result)
 
     # Compute composite score
     if result.level_results:
@@ -260,6 +266,54 @@ def _log_suite_to_mlflow(result: EvaluationSuiteResult) -> None:
         logger.debug(f"MLflow suite logging failed: {e}")
 
 
+# Value mapping between level convention and MLflow convention
+_LEVEL_TO_MLFLOW = {"pass": "yes", "fail": "no", "skip": None}
+
+
+def _log_feedbacks_to_trace(level_name: str, level_result: LevelResult) -> None:
+    """Log level feedbacks as MLflow Feedback assessments on agent traces.
+
+    This makes evaluation results visible in MLflow's trace UI, following
+    the MLflow LLM-as-a-judge pattern (mlflow.org/blog/evaluating-skills-mlflow).
+    """
+    if not level_result.trace_ids:
+        return
+
+    try:
+        from mlflow import MlflowClient
+        from mlflow.entities import Feedback
+
+        client = MlflowClient()
+
+        for trace_id in level_result.trace_ids:
+            for fb_dict in level_result.feedbacks:
+                name = fb_dict.get("name", "unknown")
+                value = _LEVEL_TO_MLFLOW.get(fb_dict.get("value", ""), fb_dict.get("value"))
+                rationale = fb_dict.get("rationale", "")
+                source = fb_dict.get("source", "CODE")
+
+                try:
+                    client.log_feedback(
+                        trace_id=trace_id,
+                        name=f"{level_name}/{name}",
+                        value=value,
+                        rationale=rationale,
+                        source=source,
+                    )
+                except Exception:
+                    # Individual feedback logging failure shouldn't stop the loop
+                    pass
+
+        logger.debug(
+            f"Logged {len(level_result.feedbacks)} feedbacks to "
+            f"{len(level_result.trace_ids)} traces for {level_name}"
+        )
+    except ImportError:
+        logger.debug("MLflow not available for feedback logging")
+    except Exception as e:
+        logger.debug(f"Feedback logging to traces failed: {e}")
+
+
 def _generate_suggestions(result: EvaluationSuiteResult) -> list[str]:
     """Analyze evaluation results and generate improvement suggestions."""
     suggestions = []
@@ -317,120 +371,415 @@ def _generate_report(config: EvaluationSuiteConfig, result: EvaluationSuiteResul
 
 
 def _build_html_report(config: EvaluationSuiteConfig, result: EvaluationSuiteResult) -> str:
-    """Build self-contained HTML evaluation report."""
+    """Build self-contained HTML evaluation report with SkillForge-style UI."""
+    import html as html_mod
+    from .reporting._styles import THEME_CSS, THEME_JS, SVG_ICONS, score_color, score_color_class
+
+    def _esc(text: str) -> str:
+        return html_mod.escape(str(text), quote=True)
+
+    def _source_badge(source: str) -> str:
+        if source == "LLM_JUDGE":
+            return '<span class="badge-llm">LLM</span>'
+        return '<span class="badge-code">CODE</span>'
+
+    def _status_badge(value: str) -> str:
+        cls = {"pass": "badge-pass", "fail": "badge-fail"}.get(value, "badge-skip")
+        return f'<span class="badge {cls}">{_esc(value.upper())}</span>'
+
+    def _classification_badge(rationale: str) -> str:
+        for cls_name, css in [
+            ("POSITIVE", "badge-positive"), ("REGRESSION", "badge-regression"),
+            ("NEEDS_SKILL", "badge-needs-skill"), ("NEUTRAL", "badge-neutral"),
+        ]:
+            if cls_name in rationale:
+                return f'<span class="badge {css}">{cls_name}</span>'
+        return ""
+
+    # ── Score bar chart ──
+    score_bars_html = ""
+    for level_name in _LEVEL_ORDER:
+        if level_name not in result.level_results:
+            continue
+        lr = result.level_results[level_name]
+        lvl_num = _LEVEL_ORDER.index(level_name) + 1
+        pct = lr.score * 100
+        color = score_color(lr.score)
+        score_bars_html += f"""
+        <div class="score-bar-row">
+            <span class="score-bar-label">L{lvl_num} {_esc(level_name)}</span>
+            <div class="score-bar-track">
+                <div class="score-bar-fill" style="width:{pct:.0f}%;background:{color}"></div>
+            </div>
+            <span class="score-bar-value" style="color:{color}">{lr.score:.0%}</span>
+        </div>"""
+
+    # ── Level detail cards ──
     level_cards = ""
     for level_name in _LEVEL_ORDER:
         if level_name not in result.level_results:
             continue
         lr = result.level_results[level_name]
-        score_color = "#4caf50" if lr.score >= 0.8 else "#ff9800" if lr.score >= 0.5 else "#f44336"
+        lvl_num = _LEVEL_ORDER.index(level_name) + 1
+        color = score_color(lr.score)
+        meta = lr.metadata or {}
 
-        # Build feedback rows
-        feedback_rows = ""
-        for f in lr.feedbacks[:50]:
-            status_color = "#4caf50" if f["value"] == "pass" else "#f44336" if f["value"] == "fail" else "#9e9e9e"
-            feedback_rows += f"""
-            <tr>
-                <td><span style="color:{status_color};font-weight:bold">{f['value'].upper()}</span></td>
-                <td style="font-size:0.85em">{f.get('name','')}</td>
-                <td style="font-size:0.85em">{f.get('rationale','')[:200]}</td>
-            </tr>"""
+        # Level-specific header stats
+        header_stats = ""
+        if level_name == "unit":
+            blocks = meta.get("code_blocks_tested", 0)
+            errors = meta.get("syntax_errors", 0)
+            header_stats = f'<span style="font-size:11px;color:var(--text-muted);margin-left:auto">{blocks} blocks tested &middot; {errors} errors</span>'
+        elif level_name == "integration":
+            n_tests = meta.get("num_integration_tests", 0)
+            success_rate = meta.get("success_rate", 0)
+            header_stats = f'<span style="font-size:11px;color:var(--text-muted);margin-left:auto">{n_tests} tests &middot; {success_rate:.0%} success</span>'
+        elif level_name == "static":
+            dims_eval = meta.get("dimensions_evaluated", 0)
+            dims_total = meta.get("dimensions_total", 10)
+            coverage = meta.get("coverage_factor", 0)
+            header_stats = f'<span style="font-size:11px;color:var(--text-muted);margin-left:auto">{dims_eval}/{dims_total} dims &middot; {coverage:.0%} coverage</span>'
+        elif level_name == "output":
+            n_cases = meta.get("num_test_cases", 0)
+            n_asset = meta.get("num_asset_checks", 0)
+            n_live = meta.get("num_live_checks", 0)
+            header_stats = f'<span style="font-size:11px;color:var(--text-muted);margin-left:auto">{n_cases} cases &middot; {n_asset} asset &middot; {n_live} live checks</span>'
+
+        # Level-specific rich content
+        rich_content = ""
+
+        # L3: Dimension score bars
+        if level_name == "static" and meta.get("criteria"):
+            dim_bars = ""
+            for dim_id, dim_score in sorted(meta["criteria"].items()):
+                pct = (dim_score / 10.0) * 100
+                dim_color = score_color(dim_score / 10.0)
+                dim_bars += f"""
+                <div class="dim-bar-row">
+                    <span class="dim-bar-label">{_esc(dim_id.replace('_', ' ').title())}</span>
+                    <div class="dim-bar-track">
+                        <div class="dim-bar-fill" style="width:{pct:.0f}%;background:{dim_color}"></div>
+                    </div>
+                    <span class="dim-bar-value" style="color:{dim_color}">{dim_score:.1f}/10</span>
+                </div>"""
+            rich_content += f'<div style="margin:8px 0">{dim_bars}</div>'
+
+            # Recommendations
+            recs = meta.get("recommendations", [])
+            if recs:
+                rec_items = "".join(
+                    f'<div class="card-row"><span style="color:var(--accent);flex-shrink:0">+</span>'
+                    f'<span style="font-size:11px;color:var(--text-secondary);line-height:1.5">{_esc(r)}</span></div>'
+                    for r in recs
+                )
+                rich_content += f"""
+                <div class="card card-accent" style="margin-top:8px">
+                    <div class="card-header">
+                        <svg class="icon"><use href="#icon-bulb"/></svg>
+                        <span class="card-title">Recommendations</span>
+                    </div>
+                    <div class="card-body">{rec_items}</div>
+                </div>"""
+
+        # L2: Task results table
+        if level_name == "integration" and lr.task_results:
+            rows = ""
+            for tr in lr.task_results:
+                status = "PASS" if tr.get("success") else "FAIL"
+                status_cls = "badge-pass" if tr.get("success") else "badge-fail"
+                trace_link = tr.get("mlflow_trace_id", "")
+                trace_cell = f'<span class="mono" style="font-size:10px">{_esc(trace_link[:12])}</span>' if trace_link else "-"
+                rows += f"""
+                <tr>
+                    <td><span class="mono">{_esc(tr.get('task_id', ''))}</span></td>
+                    <td class="mono">{tr.get('execution_time_s', 0):.1f}s</td>
+                    <td class="mono">{tr.get('tool_calls', 0)}</td>
+                    <td><span class="badge {status_cls}">{status}</span></td>
+                    <td>{trace_cell}</td>
+                </tr>"""
+            rich_content += f"""
+            <table style="margin:8px 0">
+                <tr><th>Task</th><th>Time</th><th>Tools</th><th>Status</th><th>Trace</th></tr>
+                {rows}
+            </table>"""
+
+        # L4: Per-task dimension scores
+        if level_name == "thinking" and lr.task_results:
+            for tr in lr.task_results:
+                task_id = tr.get("task_id", "unknown")
+                dims = tr.get("dimension_scores", {})
+                trace_sum = tr.get("trace_summary", {})
+                dim_bars = ""
+                for dim_id, dim_score in sorted(dims.items()):
+                    pct = (dim_score / 5.0) * 100
+                    dim_color = score_color(dim_score / 5.0)
+                    dim_bars += f"""
+                    <div class="dim-bar-row">
+                        <span class="dim-bar-label">{_esc(dim_id.title())}</span>
+                        <div class="dim-bar-track">
+                            <div class="dim-bar-fill" style="width:{pct:.0f}%;background:{dim_color}"></div>
+                        </div>
+                        <span class="dim-bar-value" style="color:{dim_color}">{dim_score:.0f}/5</span>
+                    </div>"""
+                trace_info = ""
+                if trace_sum:
+                    trace_info = f'<div class="card-row" style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border)"><span class="card-label">Trace</span><span class="card-value">{trace_sum.get("tool_calls", 0)} tools &middot; {trace_sum.get("tokens", 0)} tokens</span></div>'
+                rich_content += f"""
+                <details style="margin-top:8px">
+                    <summary><span class="mono" style="flex:1">{_esc(task_id)}</span></summary>
+                    <div class="details-body">
+                        {dim_bars}
+                        {trace_info}
+                    </div>
+                </details>"""
+
+        # L5: Per-task expandable sections with WITH/WITHOUT + score breakdown
+        if level_name == "output" and lr.task_results:
+            for tr in lr.task_results:
+                task_id = tr.get("task_id", "unknown")
+                final = tr.get("final_score", 0)
+                resp_score = tr.get("response_score", 0)
+                asset_score = tr.get("asset_verification")
+                sot_score = tr.get("source_of_truth")
+                final_color = score_color(final)
+
+                # Mini metrics
+                mini = f"""
+                <div class="mini-metrics">
+                    <div class="mini-metric">
+                        <div class="mini-metric-value" style="color:{score_color(resp_score)}">{resp_score:.0%}</div>
+                        <div class="mini-metric-label">Response</div>
+                    </div>"""
+                if asset_score is not None:
+                    mini += f"""
+                    <div class="mini-metric">
+                        <div class="mini-metric-value" style="color:{score_color(asset_score)}">{asset_score:.0%}</div>
+                        <div class="mini-metric-label">Assets</div>
+                    </div>"""
+                if sot_score is not None:
+                    mini += f"""
+                    <div class="mini-metric">
+                        <div class="mini-metric-value" style="color:{score_color(sot_score)}">{sot_score:.0%}</div>
+                        <div class="mini-metric-label">Source of Truth</div>
+                    </div>"""
+                mini += f"""
+                    <div class="mini-metric">
+                        <div class="mini-metric-value" style="color:{final_color}">{final:.0%}</div>
+                        <div class="mini-metric-label">Final (weighted)</div>
+                    </div>
+                </div>"""
+
+                # WITH/WITHOUT comparison
+                with_resp = _esc(tr.get("with_response", "(no response)"))
+                without_resp = _esc(tr.get("without_response", "(no response)"))
+                comparison = f"""
+                <div class="output-comparison" style="margin:10px 0">
+                    <div class="output-pane">
+                        <div class="output-pane-header"><span>WITH Skill</span></div>
+                        <div class="output-pane-content"><pre>{with_resp}</pre></div>
+                    </div>
+                    <div class="output-pane">
+                        <div class="output-pane-header"><span>WITHOUT Skill</span></div>
+                        <div class="output-pane-content"><pre>{without_resp}</pre></div>
+                    </div>
+                </div>"""
+
+                # Task-specific feedbacks
+                task_prefix = f"output/{task_id}/"
+                task_feedbacks = [f for f in lr.feedbacks if f.get("name", "").startswith(task_prefix)]
+                fb_rows = ""
+                for f in task_feedbacks:
+                    rationale = f.get("rationale", "")
+                    fb_rows += f"""
+                    <tr>
+                        <td>{_status_badge(f['value'])}</td>
+                        <td style="font-size:11px">{_esc(f.get('name', '').replace(task_prefix, ''))}</td>
+                        <td style="font-size:11px">{_esc(rationale[:300])}</td>
+                        <td>{_classification_badge(rationale)} {_source_badge(f.get('source', 'CODE'))}</td>
+                    </tr>"""
+
+                fb_table = ""
+                if fb_rows:
+                    fb_table = f"""
+                    <table style="margin-top:10px">
+                        <tr><th>Status</th><th>Check</th><th>Details</th><th>Type</th></tr>
+                        {fb_rows}
+                    </table>"""
+
+                rich_content += f"""
+                <details style="margin-top:8px">
+                    <summary>
+                        <span class="mono" style="flex:1">{_esc(task_id)}</span>
+                        <span class="badge badge-score badge-{score_color_class(final)}">{final:.0%}</span>
+                    </summary>
+                    <div class="details-body">
+                        {mini}
+                        {comparison}
+                        {fb_table}
+                    </div>
+                </details>"""
+
+        # Feedback table (all levels — for L5, show only non-task-specific or if no task_results)
+        show_all_feedbacks = level_name != "output" or not lr.task_results
+        if show_all_feedbacks:
+            feedback_rows = ""
+            for f in lr.feedbacks[:100]:
+                feedback_rows += f"""
+                <tr>
+                    <td>{_status_badge(f['value'])}</td>
+                    <td style="font-size:11px">{_esc(f.get('name', ''))}</td>
+                    <td style="font-size:11px">{_esc(f.get('rationale', '')[:300])}</td>
+                    <td>{_source_badge(f.get('source', 'CODE'))}</td>
+                </tr>"""
+            if feedback_rows:
+                rich_content += f"""
+                <table style="margin-top:8px">
+                    <tr><th>Status</th><th>Check</th><th>Details</th><th>Source</th></tr>
+                    {feedback_rows}
+                </table>"""
 
         level_cards += f"""
-        <div class="level-card">
-            <h3>Level {_LEVEL_ORDER.index(level_name)+1}: {level_name.upper()}
-                <span style="float:right;color:{score_color};font-size:1.2em">{lr.score:.0%}</span>
-            </h3>
-            <table>
-                <tr><th>Status</th><th>Check</th><th>Details</th></tr>
-                {feedback_rows}
-            </table>
+        <div class="section">
+            <div class="section-title">Level {lvl_num}: {_esc(level_name.upper())}</div>
+            <div class="card">
+                <div class="card-header">
+                    <svg class="icon"><use href="#icon-{'check' if lr.passed else 'x'}"/></svg>
+                    <span class="card-title">{_esc(level_name.title())}</span>
+                    <span class="badge badge-score badge-{score_color_class(lr.score)}">{lr.score:.0%}</span>
+                    {header_stats}
+                </div>
+                <div class="card-body">
+                    {rich_content}
+                </div>
+            </div>
         </div>"""
 
-    suggestion_items = ""
-    for s in result.suggestions:
-        suggestion_items += f"<li>{s}</li>"
+    # ── Suggestions ──
+    suggestions_html = ""
+    if result.suggestions:
+        sug_rows = ""
+        for s in result.suggestions:
+            # Extract category tag
+            tag = ""
+            for prefix, css in [("NEEDS_SKILL", "badge-needs-skill"), ("REGRESSION", "badge-regression"),
+                                ("QUALITY", "badge-warn"), ("FAILURE", "badge-fail")]:
+                if s.startswith(prefix):
+                    tag = f'<span class="badge {css}" style="margin-right:6px">{prefix}</span>'
+                    s = s[len(prefix):].lstrip(" [:").lstrip("]").lstrip(": ")
+                    break
+            sug_rows += f"""
+            <div class="card-row" style="align-items:flex-start;gap:8px">
+                {tag}<span style="font-size:11px;color:var(--text-secondary);line-height:1.5">{_esc(s)}</span>
+            </div>"""
+        suggestions_html = f"""
+        <div class="section">
+            <div class="section-title">Improvement Suggestions</div>
+            <div class="card card-accent">
+                <div class="card-header">
+                    <svg class="icon"><use href="#icon-bulb"/></svg>
+                    <span class="card-title">Suggestions</span>
+                </div>
+                <div class="card-body">{sug_rows}</div>
+            </div>
+        </div>"""
+
+    # ── Assemble full HTML ──
+    total_checks = sum(len(r.feedbacks) for r in result.level_results.values())
+    composite_cls = score_color_class(result.composite_score)
 
     html = f"""<!DOCTYPE html>
-<html>
+<html lang="en" data-theme="dbx-dark">
 <head>
 <meta charset="UTF-8">
-<title>Skill Evaluation: {config.skill.name}</title>
-<style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }}
-h1 {{ color: #1a1a2e; }}
-.summary {{ background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-.summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; }}
-.metric {{ text-align: center; }}
-.metric-value {{ font-size: 2em; font-weight: bold; }}
-.metric-label {{ font-size: 0.85em; color: #666; }}
-.level-card {{ background: white; padding: 20px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #eee; }}
-th {{ background: #f9f9f9; font-weight: 600; }}
-.suggestions {{ background: #fff3e0; padding: 15px; border-radius: 8px; margin-top: 20px; }}
-.suggestions h3 {{ margin-top: 0; }}
-.feedback-section {{ background: white; padding: 20px; border-radius: 8px; margin-top: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-.feedback-section textarea {{ width: 100%; height: 80px; margin: 10px 0; }}
-.feedback-section button {{ background: #1a73e8; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; }}
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark light">
+<title>Skill Evaluation: {_esc(config.skill.name)}</title>
+<style>{THEME_CSS}</style>
 </head>
 <body>
-<h1>Skill Evaluation: {config.skill.name}</h1>
-<p style="color:#666">Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} | MLflow run: {result.mlflow_run_id or 'N/A'}</p>
+{SVG_ICONS}
+<script>{THEME_JS}</script>
 
-<div class="summary">
-<h2>Summary</h2>
-<div class="summary-grid">
-    <div class="metric">
-        <div class="metric-value" style="color:{'#4caf50' if result.composite_score >= 0.8 else '#ff9800' if result.composite_score >= 0.5 else '#f44336'}">{result.composite_score:.0%}</div>
-        <div class="metric-label">Composite Score</div>
-    </div>
-    <div class="metric">
-        <div class="metric-value">{len(result.level_results)}</div>
-        <div class="metric-label">Levels Run</div>
-    </div>
-    <div class="metric">
-        <div class="metric-value">{result.duration_seconds:.0f}s</div>
-        <div class="metric-label">Duration</div>
-    </div>
-    <div class="metric">
-        <div class="metric-value">{sum(len(r.feedbacks) for r in result.level_results.values())}</div>
-        <div class="metric-label">Total Checks</div>
+<div class="top-bar">
+    <span class="top-bar-title">Skill Evaluation: {_esc(config.skill.name)}</span>
+    <span class="top-bar-meta">{datetime.now().strftime('%Y-%m-%d %H:%M')} &middot; MLflow: {_esc(result.mlflow_run_id or 'N/A')}</span>
+    <button id="theme-toggle" class="btn-secondary" onclick="toggleTheme()">DBX Dark</button>
+</div>
+
+<div class="section">
+    <div class="section-title">Summary</div>
+    <div class="metric-grid">
+        <div class="card">
+            <div class="card-header">
+                <svg class="icon"><use href="#icon-gauge"/></svg>
+                <span class="card-title">Composite Score</span>
+            </div>
+            <div class="hero-metric color-{composite_cls}">{result.composite_score:.0%}</div>
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <svg class="icon"><use href="#icon-layers"/></svg>
+                <span class="card-title">Levels Run</span>
+            </div>
+            <div class="hero-metric">{len(result.level_results)}</div>
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <svg class="icon"><use href="#icon-clock"/></svg>
+                <span class="card-title">Duration</span>
+            </div>
+            <div class="hero-metric">{result.duration_seconds:.0f}s</div>
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <svg class="icon"><use href="#icon-hash"/></svg>
+                <span class="card-title">Total Checks</span>
+            </div>
+            <div class="hero-metric">{total_checks}</div>
+        </div>
     </div>
 </div>
+
+<div class="section">
+    <div class="section-title">Level Scores</div>
+    <div class="card">
+        <div class="score-bars">{score_bars_html}</div>
+    </div>
 </div>
 
 {level_cards}
 
-{'<div class="suggestions"><h3>Improvement Suggestions</h3><ul>' + suggestion_items + '</ul></div>' if result.suggestions else ''}
+{suggestions_html}
 
-<div class="feedback-section">
-<h3>Human Feedback</h3>
-<p>Review the results above and provide feedback for optimization:</p>
-<textarea id="feedback-notes" placeholder="Enter your feedback here..."></textarea>
-<br>
-<select id="feedback-verdict">
-    <option value="good">Good — skill works well</option>
-    <option value="needs_work">Needs Work — improvements needed</option>
-    <option value="regression">Regression — skill is hurting</option>
-</select>
-<button onclick="saveFeedback()">Save Feedback</button>
+<div class="section">
+    <div class="section-title">Human Feedback</div>
+    <div class="card">
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Review the results and provide feedback:</p>
+        <textarea id="feedback-notes" placeholder="Enter your feedback here..."></textarea>
+        <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+            <select id="feedback-verdict">
+                <option value="good">Good</option>
+                <option value="needs_work">Needs Work</option>
+                <option value="regression">Regression</option>
+            </select>
+            <button class="btn-primary" onclick="saveFeedback()">Save Feedback</button>
+        </div>
+    </div>
 </div>
 
 <script>
 function saveFeedback() {{
-    const feedback = {{
-        skill_name: "{config.skill.name}",
+    var feedback = {{
+        skill_name: "{_esc(config.skill.name)}",
         timestamp: new Date().toISOString(),
         verdict: document.getElementById('feedback-verdict').value,
         notes: document.getElementById('feedback-notes').value,
         composite_score: {result.composite_score},
         level_scores: {json.dumps({k: v.score for k, v in result.level_results.items()})},
     }};
-    const blob = new Blob([JSON.stringify(feedback, null, 2)], {{type: 'application/json'}});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
+    var blob = new Blob([JSON.stringify(feedback, null, 2)], {{type: 'application/json'}});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
     a.href = url;
     a.download = 'feedback.json';
     a.click();

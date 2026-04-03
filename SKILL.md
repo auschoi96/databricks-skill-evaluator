@@ -1,300 +1,236 @@
 ---
 name: skill-evaluator
-description: "Evaluate Claude Code skills using a 5-level evaluation pyramid. Use when asked to evaluate a skill, test skill quality, check if a SKILL.md works, score a skill, audit skill content, or run a full eval. Calls skill-evaluator MCP tools to authenticate, discover, test, and score skills against real Databricks workspaces."
+description: "Evaluates Claude Code skills using a 5-level testing pyramid against real Databricks workspaces. Use when asked to evaluate a skill, test skill quality, check if a SKILL.md works, score a skill, audit skill content, or run a full eval. Supports quick eval (L1+L3 in seconds, no agent) and full agent-based eval (L2+L4+L5 in minutes). Logs results to MLflow for tracking and comparison."
 ---
 
 # Skill Evaluator
 
-You are an evaluation agent. When activated, you follow the workflow below **step by step**. Do not skip steps. Do not run the next step until you have presented results from the current step and confirmed whether to continue.
+You are an evaluation agent. Follow the workflow below step by step.
+
+Levels run in cost order, not numerical order: L1 (free) and L3 (1 LLM call) run first as a quick gate. Agent-based levels L2, L4, L5 only run if the user requests full evaluation and the quick eval passes.
+
+## Prerequisites
+
+The `dse` CLI must be installed:
+
+```bash
+pip install -e /path/to/databricks-skill-evaluator
+```
+
+Verify with `dse --help`. For agent-based levels (L2/L4/L5), a Databricks workspace must be configured.
+
+---
 
 ## Dispatch
 
-Match the user's request to an entry point:
-
 | User says | Start at |
 |-----------|----------|
-| "Check my skill" / "Is my SKILL.md good?" / "Score my skill" | **Step 1** (runs through Step 4 quick eval) |
-| "Full evaluation" / "Test everything" / "Evaluate my skill" | **Step 1** (runs through Step 7) |
-| "Help me set up evaluation" / "Init eval" | **Step 1** (stops after Step 2 if no eval config) |
-| "Why is my skill making things worse?" | **Step 1** → skip to **Step 6** (L5 output eval) |
-| "Run integration tests" / "Run L2" | **Step 1** → skip to **Step 5** |
+| "Check my skill" / "Is my SKILL.md good?" / "Score my skill" | Phase 0 (quick eval through Phase 2) |
+| "Full evaluation" / "Test everything" / "Evaluate my skill" | Phase 0 (full eval through Phase 4) |
+| "Help me set up evaluation" / "Init eval" | Phase 0 (stop after Phase 1 if no eval config) |
+| "Why is my skill making things worse?" | Phase 0 then skip to L5 in Phase 3 |
+| "Run integration tests" / "Run L2" | Phase 0 then skip to L2 in Phase 3 |
+| "Optimize my skill" / "Improve my SKILL.md" | Phase 4 refinement loop |
 
-If the request doesn't clearly match, start at **Step 1** and run through **Step 4** (quick eval). Ask the user if they want to continue to agent-based levels.
-
----
-
-## Step 1: Authenticate
-
-**Goal**: Ensure a workspace connection exists.
-
-Check if `~/.dse/config.yaml` exists. If not, ask the user for:
-- Databricks profile name (from `~/.databrickscfg`)
-- Catalog and schema for test data
-- (Optional) MLflow experiment path
-
-Then call:
-```
-authenticate_workspace(profile, catalog, schema, experiment_path?)
-```
-
-**GATE**: If authentication fails, STOP. Show the error and ask the user to fix their Databricks config.
-
-If `~/.dse/config.yaml` already exists, skip to Step 2.
+If the request doesn't clearly match, run through Phase 2 (quick eval). Ask the user if they want to continue to agent-based levels.
 
 ---
 
-## Step 2: Discover the Skill
+## Phase 0: Authenticate
 
-**Goal**: Parse the skill directory and check readiness.
+Check if `~/.dse/config.yaml` exists. If it does, skip to Phase 1.
 
-Ask the user for the skill directory path if not already known. Then call:
+If not, ask the user for their Databricks profile name (from `~/.databrickscfg`) and catalog/schema for test resources. Then run:
+
+```bash
+dse auth --profile DEFAULT --catalog main --schema default
 ```
-discover_skill(skill_dir)
-```
 
-**Present to user**:
-- Skill name, description, file count
-- Whether eval config exists (`has_eval_config`)
+Options: `--warehouse-id <id>`, `--experiment /Shared/skill-evals`.
 
-**GATE — eval config check**:
-- If `has_eval_config` is **false**: call `init_eval_config(skill_dir)` to scaffold templates. Then STOP and tell the user:
-  > "I created eval templates in `<skill_dir>/eval/`. You need to fill in the TODO placeholders in these files before I can run evaluation:
-  > - `ground_truth.yaml` — your test cases (prompts + expected outputs)
-  > - `thinking_instructions.md` — what good reasoning looks like for this skill
-  > - `output_instructions.md` — what correct output looks like for this skill
-  >
-  > Come back when these are filled in and say 'evaluate my skill'."
-- If `has_eval_config` is **true**: proceed to Step 3.
+**GATE**: If authentication fails:
+
+| Error contains | Fix |
+|---------------|-----|
+| "No ~/.databrickscfg" | Run: `databricks auth login --host <WORKSPACE_URL>` |
+| "Profile not found" | Check available profiles listed in the error |
+| "Cannot connect" | Token may be expired — re-run `databricks auth login` |
 
 ---
 
-## Step 3: L1 — Unit Tests
+## Phase 1: Discover the Skill and its MCP Tools
 
-**Goal**: Validate code block syntax and links. Fast, free, no agent.
+Ask the user for:
+1. **Skill directory path** — the directory containing SKILL.md
+2. **MCP tools location** — which `.mcp.json` has the MCP servers the skill needs (e.g., the Databricks MCP server). The skill being evaluated likely references MCP tools it doesn't define itself. Ask: "Where is the `.mcp.json` that defines the MCP tools this skill uses?" Common locations:
+   - The parent project's `.mcp.json`
+   - `~/.claude.json` (user's global Claude Code config)
+   - A specific path the user provides
 
-Call:
-```
-run_unit_tests(skill_dir)
-```
+Run:
 
-**Interpret**: Scan feedbacks for any with `value: "fail"`. These are broken code blocks (Python syntax errors, invalid YAML, malformed SQL) or dead markdown links.
-
-**Present to user**:
-```
-## L1: Unit Tests — <PASS/FAIL> (<score as %>)
-- Code blocks tested: <N>
-- Syntax errors: <N>  (list each with file + block number)
-- Dead links: <N>  (list each)
+```bash
+dse init <skill_dir>
 ```
 
-**GATE**: If there are syntax errors or dead links, flag them as **must-fix before continuing**. Ask: "Fix these issues first, or continue evaluation anyway?"
-- If user says fix → STOP, show what to fix
-- If user says continue → proceed to Step 4
+This discovers the skill and scaffolds eval templates if missing.
 
-Save the result for report generation later.
+**GATE — MCP config check**: If the user provided an `.mcp.json` path, verify it exists and pass it as `--mcp-json <path>` to all subsequent `dse evaluate` commands. Without this, agent-based levels (L2/L4/L5) will have no MCP tools and fail.
+
+**GATE — eval config check**: If `eval/ground_truth.yaml` doesn't exist or contains only TODOs, STOP and tell the user:
+
+> Fill in the TODO placeholders before running evaluation:
+> - `ground_truth.yaml` — test cases (prompts + expected outputs)
+> - `thinking_instructions.md` — what good reasoning looks like
+> - `output_instructions.md` — what correct output looks like
+>
+> For the full ground_truth.yaml schema, read [TECHNICAL.md section Data Formats](TECHNICAL.md#data-formats).
+
+If eval config is ready, proceed to Phase 2.
 
 ---
 
-## Step 4: L3 — Static Eval
+## Phase 2: Quick Eval (L1 + L3)
 
-**Goal**: LLM judge scores the SKILL.md quality across 10 dimensions. 1 LLM call, no agent.
+Run unit tests and static eval together — these are fast and don't require an agent:
 
-Call:
-```
-run_static_eval(skill_dir)
-```
-
-**Interpret**: Check `metadata.criteria` for per-dimension scores (1-10). Any dimension below 6 is a problem. Check `metadata.recommendations` for specific fixes.
-
-**Present to user** as a scorecard:
-```
-## L3: Static Eval — <overall_score>/10
-
-| Dimension               | Score | Status |
-|-------------------------|-------|--------|
-| Self-Contained          | 8     | PASS   |
-| No Conflicting Info     | 9     | PASS   |
-| Security                | 7     | PASS   |
-| LLM-Navigable Structure| 8     | PASS   |
-| Actionable Instructions | 5     | ⚠ LOW  |
-| Scoped Clearly          | 8     | PASS   |
-| Tools/CLI Accuracy      | 6     | PASS   |
-| Examples Are Valid       | 10    | PASS   |
-| Error Handling Guidance  | 4     | ⚠ LOW  |
-| No Hallucination Triggers| 7    | PASS   |
-
-### Recommendations
-- <list each recommendation from metadata.recommendations>
+```bash
+dse evaluate <skill_dir> --levels unit,static
 ```
 
-Mark any dimension < 6 with "⚠ LOW" and bold it. These are the priority fixes.
+**Parse the output** for L1 and L3 scores. Present:
 
-**GATE — quick eval complete**:
-
-If the user only asked for a quick check ("check my skill", "is this good?"), present a summary combining L1 + L3 results and STOP:
 ```
 ## Quick Eval Summary
-- L1 Unit Tests: <score>%
-- L3 Static Eval: <score>/10
-- Top issues: <list the 2-3 most important findings>
-- To run full agent-based evaluation, say "run full evaluation"
+- L1 Unit Tests: score% — N code blocks tested, N syntax errors
+- L3 Static Eval: score/10 — dimensions < 6 are priority fixes
+- Top issues: (2-3 most important findings)
 ```
 
-If the user asked for full evaluation, proceed to Step 5. Otherwise ask: "Want me to continue with agent-based testing? This runs real Claude Code agents against your Databricks workspace and takes several minutes per test case."
-
-Save the result for report generation later.
+**GATE**: If the user only asked for a quick check, STOP here. Otherwise ask: "Continue with agent-based testing? This runs real Claude agents against your Databricks workspace — several minutes per test case."
 
 ---
 
-## Step 5: L2 — Integration Tests
+## Phase 3: Agent Eval (L2 + L4 + L5)
 
-**Goal**: Run a real agent with the skill against the Databricks workspace. Tests tool connectivity and execution.
+**IMPORTANT**: Always pass `--mcp-json <path>` from Phase 1. Without it, the spawned agent has no MCP tools.
 
-**Before running**, tell the user:
-> "Starting integration tests. This runs a Claude Code agent for each test case in your ground_truth.yaml. Estimated time: ~2-5 minutes per test case."
+Run all agent-based levels:
 
-Call:
-```
-run_integration_tests(skill_dir)
+```bash
+dse evaluate <skill_dir> --levels integration,thinking,output --mcp-json <path> --agent-timeout 300
 ```
 
-**Interpret**: Check feedbacks for tool connectivity failures, execution errors, and trace expectation violations (required tools not called, banned tools used).
+Or run individual levels if the user asked for a specific one:
 
-**Present to user**:
-```
-## L2: Integration Tests — <PASS/FAIL> (<score as %>)
-
-| Test Case | Status | Tools Called | Issues |
-|-----------|--------|-------------|--------|
-| <id>      | PASS   | create_or_update_genie | — |
-| <id>      | FAIL   | (none)      | MCP tool not reachable |
+```bash
+dse evaluate <skill_dir> --levels integration --mcp-json <path>
+dse evaluate <skill_dir> --levels thinking --mcp-json <path>
+dse evaluate <skill_dir> --levels output --mcp-json <path>
 ```
 
-**GATE**: If integration tests show MCP connectivity failures, STOP. The workspace or MCP server config is broken — agent-based levels will all fail. Tell the user what to fix.
+Optional flags: `--agent-model <model>`, `--agent-timeout <seconds>`, `--judge-model <model>`.
 
-Save the result for report generation later. Proceed to Step 6.
+### L2: Integration Tests
 
----
+Tests MCP tool connectivity and executes ground_truth test cases against a real Databricks workspace. Needs >= 80% tool success rate.
 
-## Step 6: L4 + L5 — Thinking Eval & Output Eval
-
-**Goal**: Evaluate agent reasoning quality (L4) and run the WITH vs WITHOUT skill comparison (L5). These are the deep evaluation levels.
+**GATE**: If MCP connectivity failures appear, STOP. The workspace or MCP config is broken — L4 and L5 will also fail.
 
 ### L4: Thinking Eval
 
-Call:
-```
-run_thinking_eval(skill_dir, mcp_json_path?)
-```
-
-The `mcp_json_path` should point to the `.mcp.json` that configures the Databricks MCP server. If omitted, auto-discovers from parent directories.
-
-**Present to user**:
-```
-## L4: Thinking Eval — <score as %>
-
-| Test Case | Efficiency | Clarity | Recovery | Completeness |
-|-----------|-----------|---------|----------|--------------|
-| <id>      | 4/5       | 5/5     | 3/5      | 5/5          |
-
-Key findings:
-- <list notable reasoning issues from feedbacks>
-```
+Evaluates agent reasoning quality across 4 dimensions (scored 1-5 each): Efficiency, Clarity, Recovery, Completeness.
 
 ### L5: Output Eval (WITH vs WITHOUT)
 
-Call:
-```
-run_output_eval(skill_dir, mcp_json_path?)
-```
+The core controlled experiment. Each test case runs WITH the skill and WITHOUT, then assertions are classified:
 
-This is the core controlled experiment: each test case runs twice (WITH skill, WITHOUT skill) and assertions are classified.
+- **POSITIVE**: WITH passes, WITHOUT fails. Skill taught something useful.
+- **REGRESSION**: WITH fails, WITHOUT passes. Skill confused the agent. Fix priority #1.
+- **NEEDS_SKILL**: Both fail. Skill doesn't cover this yet. Fix priority #2.
+- **NEUTRAL**: Both pass. Agent already knows this — skill not needed here.
 
-**Present to user** with classification breakdown:
-```
-## L5: Output Eval — <score as %>
-
-| Test Case | Assertion | WITH | WITHOUT | Classification |
-|-----------|-----------|------|---------|---------------|
-| <id>      | "calls create_or_update_genie" | PASS | FAIL | ✅ POSITIVE |
-| <id>      | "includes sample questions"     | FAIL | PASS | 🔴 REGRESSION |
-| <id>      | "handles bad table error"       | FAIL | FAIL | 🟡 NEEDS_SKILL |
-
-### Classification Summary
-- ✅ POSITIVE: <N> — Skill is helping
-- 🔴 REGRESSION: <N> — Skill is hurting (FIX THESE FIRST)
-- 🟡 NEEDS_SKILL: <N> — Skill must add this content
-- ⚪ NEUTRAL: <N> — Agent already knows this
-```
-
-**Classification reference** (for interpreting results):
-- **POSITIVE**: WITH passes, WITHOUT fails → skill taught something useful
-- **REGRESSION**: WITH fails, WITHOUT passes → skill confused the agent. Fix priority #1.
-- **NEEDS_SKILL**: Both fail → skill doesn't cover this yet. Fix priority #2.
-- **NEUTRAL**: Both pass → agent already knows this, skill not needed here.
-
-Save both results for report generation. Proceed to Step 7.
+Score weighted: 50% response quality + 30% asset verification + 20% source-of-truth comparison.
 
 ---
 
-## Step 7: Generate Report & Final Summary
+## Phase 4: Report & Summary
 
-**Goal**: Produce the HTML report and present a final summary.
+After running levels, an HTML report is generated at `<skill_dir>/eval/report.html`. Present:
 
-Call `generate_report` with all collected results:
-```
-generate_report(skill_dir, results={
-  "unit": <L1 result>,
-  "static": <L3 result>,
-  "integration": <L2 result if run>,
-  "thinking": <L4 result if run>,
-  "output": <L5 result if run>
-})
-```
-
-Only include levels that were actually run.
-
-**Present final summary to user**:
 ```
 ## Evaluation Complete
 
 | Level | Score | Status |
 |-------|-------|--------|
-| L1: Unit Tests     | <score>%  | PASS/FAIL |
-| L3: Static Eval    | <score>/10 | PASS/FAIL |
-| L2: Integration    | <score>%  | PASS/FAIL |
-| L4: Thinking       | <score>%  | PASS/FAIL |
-| L5: Output (W/WO)  | <score>%  | PASS/FAIL |
-| **Composite**      | **<score>%** | |
+| L1: Unit Tests     | score%  | PASS/FAIL |
+| L3: Static Eval    | score/10 | PASS/FAIL |
+| L2: Integration    | score%  | PASS/FAIL |
+| L4: Thinking       | score%  | PASS/FAIL |
+| L5: Output (W/WO)  | score%  | PASS/FAIL |
+| **Composite**      | **score%** | |
 
 ### Top Issues (prioritized)
-1. 🔴 REGRESSION: <specific issue + which SKILL.md section to fix>
-2. 🟡 NEEDS_SKILL: <what content to add to SKILL.md>
-3. ⚠ LOW static score: <dimension + recommendation>
-
-### Concrete Suggestions
-- <Specific edits to SKILL.md sections, referencing line numbers or headings>
+1. REGRESSION: specific issue + which SKILL.md section to fix
+2. NEEDS_SKILL: what content to add
+3. LOW static score: dimension + recommendation
 
 ### Next Steps
-- [ ] Fix regressions in SKILL.md
+- [ ] Fix regressions
 - [ ] Add missing coverage for NEEDS_SKILL items
 - [ ] Re-run evaluation to verify improvements
-
-📄 HTML report saved to: `<skill_dir>/eval/report.html`
 ```
 
 ---
 
-## Tool Reference
+## Full Eval (all levels at once)
 
-| Tool | Level | Agent? | Purpose |
-|------|-------|--------|---------|
-| `authenticate_workspace` | Setup | No | Connect to Databricks workspace |
-| `discover_skill` | Setup | No | Parse skill directory, check eval readiness |
-| `init_eval_config` | Setup | No | Scaffold eval/ templates for user to fill in |
-| `run_unit_tests` | L1 | No | Validate code block syntax and markdown links |
-| `run_static_eval` | L3 | No | LLM judge scores SKILL.md quality (10 dimensions, 1-10) |
-| `run_integration_tests` | L2 | Yes | Real agent execution against Databricks |
-| `run_thinking_eval` | L4 | Yes | Agent reasoning: efficiency, clarity, recovery |
-| `run_output_eval` | L5 | Yes | WITH vs WITHOUT skill controlled experiment |
-| `generate_report` | Report | No | Create HTML report from collected results |
+To run everything in one shot:
+
+```bash
+dse evaluate <skill_dir> --levels all --mcp-json <path> --suggest-improvements
+```
+
+Add `--experiment /Shared/skill-evals` to log to MLflow. Add `--compare-baseline <run_id>` to compare against a previous run.
+
+---
+
+## Iterative Refinement
+
+1. **Run eval** — review the report
+2. **Read failure rationales** — each feedback explains WHY it failed
+3. **Fix the SKILL.md** — use rationales to make targeted edits
+4. **Rerun the same levels** — verify improvements
+5. **Compare in MLflow** — track scores across runs
+
+Write your `ground_truth.yaml` assertions BEFORE polishing the skill. The assertions define the specification. Then iterate on the SKILL.md until the judges pass.
+
+---
+
+## Error Recovery
+
+| Error | Fix |
+|-------|-----|
+| "No ~/.databrickscfg found" | Run: `databricks auth login --host <URL>` |
+| "Profile 'X' not found" | Check available profiles in error message |
+| "Cannot connect to workspace" | Re-run: `databricks auth login` |
+| "No SKILL.md found in ..." | Verify the directory contains SKILL.md |
+| "No test cases in ground_truth.yaml" | Run `dse init`, fill in TODOs |
+| "MCP tool not reachable" | Check `.mcp.json` path, verify MCP server starts |
+| "REQUEST_LIMIT_EXCEEDED" | Wait 30s and retry |
+| "Agent timeout" | Increase `--agent-timeout` or simplify the test case |
+
+---
+
+## Scoring
+
+| Level | Pass | Formula |
+|-------|------|---------|
+| L1: Unit | >= 0.5 | passed_checks / total_checks |
+| L2: Integration | >= 0.5 | successful_tests / total_tests |
+| L3: Static | >= 0.5 | (mean_dimension / 10) * coverage_factor |
+| L4: Thinking | >= 0.5 | mean(dimension_scores) / 5 |
+| L5: Output | >= 0.5 | 50% response + 30% assets + 20% source_of_truth |
+| Composite | — | mean(all level scores) |
+
+For detailed scoring formulas, see [TECHNICAL.md section Scoring Formulas](TECHNICAL.md#scoring-formulas).

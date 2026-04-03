@@ -3,7 +3,8 @@
 Evaluates WHAT the agent produces across three dimensions:
 1. Response quality: WITH vs WITHOUT skill comparison via semantic grader
 2. Asset verification: Did the agent actually create the resources it claimed to?
-   Uses MCP tools to verify created artifacts (Genie Spaces, dashboards, etc.)
+   - Trace-based: inspect tool call inputs/results from the execution log
+   - Live verification: call Databricks SDK to confirm resources actually exist
 3. Source of truth: Compare created assets against expected output files
 
 The key insight: evaluating the response text alone isn't enough. A skill like
@@ -56,6 +57,7 @@ class OutputEvalLevel(EvalLevel):
 
         feedbacks: list[dict[str, Any]] = []
         task_results: list[dict[str, Any]] = []
+        trace_ids: list[str] = []
 
         test_cases = config.test_instructions.ground_truth
         if not test_cases:
@@ -83,6 +85,10 @@ class OutputEvalLevel(EvalLevel):
                     model=config.agent_model,
                 )
 
+                # Capture MLflow trace ID for assessment logging
+                if with_result.mlflow_trace_id:
+                    trace_ids.append(with_result.mlflow_trace_id)
+
                 # ── Phase 2: Run agent WITHOUT skill (cached baseline) ──
                 prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
                 if prompt_hash in _baseline_cache:
@@ -104,11 +110,18 @@ class OutputEvalLevel(EvalLevel):
                 )
                 feedbacks.extend(response_feedbacks)
 
-                # ── Phase 4: Asset verification (did the agent actually create things?) ──
+                # ── Phase 4a: Asset verification (trace-based) ──
                 asset_feedbacks = self._verify_assets(
                     case_id, with_result, expectations, config,
                 )
                 feedbacks.extend(asset_feedbacks)
+
+                # ── Phase 4b: Live asset verification (Databricks SDK) ──
+                live_feedbacks = self._verify_live_assets(
+                    case_id, with_result, expectations, config,
+                )
+                feedbacks.extend(live_feedbacks)
+                asset_feedbacks.extend(live_feedbacks)
 
                 # ── Phase 5: Source of truth comparison ──
                 sot_feedbacks = self._compare_source_of_truth(
@@ -138,6 +151,7 @@ class OutputEvalLevel(EvalLevel):
                     "asset_verification": asset_pass_rate,
                     "source_of_truth": sot_pass_rate,
                     "final_score": task_score,
+                    "mlflow_trace_id": with_result.mlflow_trace_id,
                 })
 
             except Exception as e:
@@ -157,11 +171,13 @@ class OutputEvalLevel(EvalLevel):
             score=score,
             feedbacks=feedbacks,
             task_results=task_results,
+            trace_ids=trace_ids,
             metadata={
                 "pass_rate_with": score,
                 "num_test_cases": len(test_cases),
                 "num_assertions": len([f for f in feedbacks if f["source"] != "CODE" or "asset" in f["name"]]),
                 "num_asset_checks": len([f for f in feedbacks if "asset" in f["name"]]),
+                "num_live_checks": len([f for f in feedbacks if "/live/" in f["name"]]),
             },
         )
 
@@ -175,6 +191,15 @@ class OutputEvalLevel(EvalLevel):
     ) -> tuple[list[dict], float]:
         """Grade response text WITH vs WITHOUT using semantic grader."""
         feedbacks = []
+
+        # Inject output_instructions as additional guidelines for the judge
+        grading_expectations = dict(expectations)
+        output_instructions = config.test_instructions.output_instructions
+        if output_instructions:
+            existing_guidelines = list(grading_expectations.get("guidelines", []))
+            existing_guidelines.append(f"Follow these output evaluation criteria: {output_instructions}")
+            grading_expectations["guidelines"] = existing_guidelines
+
         try:
             from ..grading.semantic_grader import grade_with_without, compute_score
 
@@ -188,7 +213,7 @@ class OutputEvalLevel(EvalLevel):
             with_assertions, without_assertions, diagnostics = grade_with_without(
                 with_response=with_result.response_text,
                 without_response=without_result.response_text,
-                expectations=expectations,
+                expectations=grading_expectations,
                 judge_model=config.judge_model or "databricks/databricks-claude-sonnet-4-6",
                 with_transcript=with_transcript,
             )
@@ -377,8 +402,13 @@ class OutputEvalLevel(EvalLevel):
                 if tc.result:
                     tool_summary += f"\n[TOOL_RESULT] {_truncate(tc.result, 500)}"
 
-        prompt = f"""Verify whether these assertions are satisfied based on the agent's tool calls and their results.
+        # Include output_instructions if available
+        output_ctx = ""
+        if config.test_instructions.output_instructions:
+            output_ctx = f"\n## Output Evaluation Criteria\n{config.test_instructions.output_instructions}\n"
 
+        prompt = f"""Verify whether these assertions are satisfied based on the agent's tool calls and their results.
+{output_ctx}
 ## Tool Call Log
 {tool_summary}
 
@@ -417,6 +447,200 @@ Return JSON array:
         except Exception as e:
             logger.error(f"Asset LLM verification failed: {e}")
             return []
+
+    # ──────────────────────────────────────────────────────────────────
+    # Phase 4b: Live asset verification via Databricks SDK
+    # ──────────────────────────────────────────────────────────────────
+
+    def _get_workspace_client(self, config: LevelConfig):
+        """Create a Databricks WorkspaceClient from the eval config."""
+        try:
+            from databricks.sdk import WorkspaceClient
+        except ImportError:
+            logger.warning("databricks-sdk not installed — live verification skipped")
+            return None
+
+        try:
+            return WorkspaceClient(profile=config.workspace.profile)
+        except Exception as e:
+            logger.warning(f"Failed to create WorkspaceClient: {e}")
+            return None
+
+    def _verify_live_assets(
+        self, case_id: str, agent_result, expectations: dict, config: LevelConfig,
+    ) -> list[dict[str, Any]]:
+        """Verify resources actually exist in Databricks via SDK calls.
+
+        Reads expectations.asset_verification.verify_live from ground_truth.yaml.
+        For each entry, extracts the resource ID from the agent's trace and calls
+        the Databricks SDK to confirm the resource exists with expected properties.
+        """
+        feedbacks = []
+        asset_expectations = expectations.get("asset_verification", {})
+        verify_live = asset_expectations.get("verify_live", [])
+        if not verify_live:
+            return feedbacks
+
+        trace = agent_result.trace_metrics if hasattr(agent_result, "trace_metrics") else None
+        if not trace:
+            return feedbacks
+
+        client = self._get_workspace_client(config)
+        if client is None:
+            feedbacks.append({
+                "name": f"output/{case_id}/live/sdk_unavailable",
+                "value": "skip",
+                "rationale": "Databricks SDK not available for live verification",
+                "source": "CODE",
+            })
+            return feedbacks
+
+        for entry in verify_live:
+            resource_type = entry.get("resource_type", "unknown")
+            extract_from = entry.get("extract_id_from", "")
+            id_field = entry.get("id_field", "id")
+            checks = entry.get("checks", [])
+
+            # Extract resource ID from the agent's tool call results
+            resource_id = self._extract_id_from_trace(trace, extract_from, id_field)
+            if not resource_id:
+                feedbacks.append({
+                    "name": f"output/{case_id}/live/{resource_type}/id_not_found",
+                    "value": "fail",
+                    "rationale": f"Could not extract '{id_field}' from '{extract_from}' tool results",
+                    "source": "CODE",
+                })
+                continue
+
+            # Fetch the live resource via SDK
+            live_data = self._fetch_live_resource(client, resource_type, resource_id)
+            if live_data is None:
+                feedbacks.append({
+                    "name": f"output/{case_id}/live/{resource_type}/not_found",
+                    "value": "fail",
+                    "rationale": f"{resource_type} '{resource_id}' does not exist or is inaccessible",
+                    "source": "CODE",
+                })
+                continue
+
+            feedbacks.append({
+                "name": f"output/{case_id}/live/{resource_type}/exists",
+                "value": "pass",
+                "rationale": f"{resource_type} '{resource_id}' exists in workspace",
+                "source": "CODE",
+            })
+
+            # Run property checks against the live data
+            for check in checks:
+                check_feedback = self._run_live_check(
+                    case_id, resource_type, resource_id, live_data, check,
+                )
+                feedbacks.append(check_feedback)
+
+        return feedbacks
+
+    def _extract_id_from_trace(self, trace, tool_name: str, id_field: str) -> str | None:
+        """Extract a resource ID from a specific tool call's result in the trace."""
+        matching_calls = [tc for tc in trace.tool_calls if tc.name == tool_name]
+        if not matching_calls:
+            return None
+
+        # Check the last call (in case of retries)
+        tc = matching_calls[-1]
+        result_data = _parse_tool_result(tc.result)
+        if result_data is None:
+            return None
+
+        return str(result_data[id_field]) if id_field in result_data else None
+
+    def _fetch_live_resource(self, client, resource_type: str, resource_id: str) -> dict | None:
+        """Fetch a resource from Databricks and return its properties as a dict."""
+        try:
+            if resource_type == "genie_space":
+                resource = client.genie.get_space(resource_id)
+            elif resource_type == "dashboard":
+                resource = client.lakeview.get(resource_id)
+            elif resource_type == "job":
+                resource = client.jobs.get(int(resource_id))
+            elif resource_type == "pipeline":
+                resource = client.pipelines.get(resource_id)
+            else:
+                logger.warning(f"Unsupported resource type for live verification: {resource_type}")
+                return None
+
+            # Convert SDK object to dict for uniform property checking
+            if hasattr(resource, "as_dict"):
+                return resource.as_dict()
+            elif hasattr(resource, "__dict__"):
+                return {k: v for k, v in resource.__dict__.items() if not k.startswith("_")}
+            else:
+                return {"_raw": str(resource)}
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch {resource_type} '{resource_id}': {e}")
+            return None
+
+    def _run_live_check(
+        self, case_id: str, resource_type: str, resource_id: str,
+        live_data: dict, check: dict,
+    ) -> dict[str, Any]:
+        """Run a single property check against live resource data."""
+        field_name = check.get("field", "")
+        operator = check.get("operator", "exists")
+        expected = check.get("value")
+
+        # Navigate nested fields (e.g., "config.tables")
+        actual = live_data
+        for part in field_name.split("."):
+            if isinstance(actual, dict):
+                actual = actual.get(part)
+            else:
+                actual = None
+                break
+
+        passed = False
+        rationale = ""
+
+        if operator == "exists":
+            passed = actual is not None
+            rationale = f"Field '{field_name}' {'exists' if passed else 'does not exist'}"
+
+        elif operator == "eq":
+            passed = str(actual).lower() == str(expected).lower() if actual is not None else False
+            rationale = f"Field '{field_name}': expected '{expected}', got '{_truncate(str(actual), 100)}'"
+
+        elif operator == "contains":
+            passed = str(expected).lower() in str(actual).lower() if actual is not None else False
+            rationale = f"Field '{field_name}': {'contains' if passed else 'does not contain'} '{expected}'"
+
+        elif operator == "length_gte":
+            actual_len = len(actual) if hasattr(actual, "__len__") else 0
+            passed = actual_len >= int(expected)
+            rationale = f"Field '{field_name}': length {actual_len} (need >= {expected})"
+
+        elif operator == "gte":
+            try:
+                passed = float(actual) >= float(expected) if actual is not None else False
+                rationale = f"Field '{field_name}': {actual} >= {expected} = {passed}"
+            except (ValueError, TypeError):
+                rationale = f"Field '{field_name}': cannot compare {actual} >= {expected}"
+
+        elif operator == "lte":
+            try:
+                passed = float(actual) <= float(expected) if actual is not None else False
+                rationale = f"Field '{field_name}': {actual} <= {expected} = {passed}"
+            except (ValueError, TypeError):
+                rationale = f"Field '{field_name}': cannot compare {actual} <= {expected}"
+
+        else:
+            rationale = f"Unknown operator '{operator}'"
+
+        return {
+            "name": f"output/{case_id}/live/{resource_type}/{field_name or 'check'}",
+            "value": "pass" if passed else "fail",
+            "rationale": rationale,
+            "source": "CODE",
+        }
 
     # ──────────────────────────────────────────────────────────────────
     # Phase 5: Source of truth comparison

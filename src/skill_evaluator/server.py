@@ -54,6 +54,9 @@ def _build_level_config(
     else:
         mcp_config = MCPConfig.auto_discover(skill_path)
 
+    if mcp_config:
+        mcp_config.resolve_available_tools()
+
     return LevelConfig(
         workspace=ws_config,
         skill=skill,
@@ -182,18 +185,23 @@ def init_eval_config(skill_dir: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def run_unit_tests(skill_dir: str) -> str:
-    """Run Level 1 unit tests on a skill — validate code block syntax.
+def run_unit_tests(
+    skill_dir: str,
+    mcp_json_path: Optional[str] = None,
+) -> str:
+    """Run Level 1 unit tests on a skill — validate syntax and tool availability.
 
     Extracts all fenced code blocks from SKILL.md and reference files,
-    validates Python/SQL/YAML syntax, and checks for broken markdown links.
+    validates Python/SQL/YAML syntax, checks that referenced MCP tools
+    actually exist in the MCP server, and checks for broken markdown links.
     No agent execution needed. Runs in seconds.
 
     Args:
         skill_dir: Absolute path to the skill directory
+        mcp_json_path: Path to .mcp.json for tool verification (auto-discovers if omitted)
     """
     try:
-        config = _build_level_config(skill_dir)
+        config = _build_level_config(skill_dir, mcp_json_path=mcp_json_path)
         from .levels.unit_tests import UnitTestLevel
         result = UnitTestLevel().run(config)
         return _safe_json(result.to_dict())
@@ -208,6 +216,7 @@ def run_unit_tests(skill_dir: str) -> str:
 @mcp.tool()
 def run_static_eval(
     skill_dir: str,
+    mcp_json_path: Optional[str] = None,
     judge_model: Optional[str] = None,
 ) -> str:
     """Run Level 3 static evaluation — LLM judge scores the SKILL.md quality.
@@ -222,10 +231,11 @@ def run_static_eval(
 
     Args:
         skill_dir: Absolute path to the skill directory
+        mcp_json_path: Path to .mcp.json for tool accuracy verification (auto-discovers if omitted)
         judge_model: LLM model for semantic evaluation (default: databricks-claude-sonnet-4-6)
     """
     try:
-        config = _build_level_config(skill_dir, judge_model=judge_model)
+        config = _build_level_config(skill_dir, mcp_json_path=mcp_json_path, judge_model=judge_model)
         from .levels.static_eval import StaticEvalLevel
         result = StaticEvalLevel().run(config)
         return _safe_json(result.to_dict())

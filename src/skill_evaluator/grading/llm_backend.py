@@ -1,10 +1,11 @@
 """LLM infrastructure for skill evaluation.
 
-Extracted from ai-dev-kit/.test/src/skill_test/optimize/judges.py
-
 Provides model fallback chains, rate limiting, LLM call budgeting,
 AI Gateway routing, and the ``completion_with_fallback`` utility used
-by ``semantic_grader.py`` and ``runner.py``.
+by ``semantic_grader.py`` and evaluation levels.
+
+Uses the OpenAI client to call Databricks Foundation Model APIs
+(OpenAI-compatible serving endpoints).
 
 Model fallback:
     On rate limit errors (REQUEST_LIMIT_EXCEEDED), automatically retries with
@@ -26,7 +27,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_JUDGE_LM = os.environ.get("GEPA_JUDGE_LM", "databricks:/databricks-claude-sonnet-4-6")
+DEFAULT_JUDGE_LM = os.environ.get("GEPA_JUDGE_LM", "databricks/databricks-claude-sonnet-4-6")
 
 # ---------------------------------------------------------------------------
 # Fallback model chain for rate limit errors
@@ -70,8 +71,11 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 def _is_workspace_error(exc: Exception) -> bool:
     """Detect workspace-level errors where retrying or falling back is pointless.
 
-    Catches 403/IP ACL blocks, auth failures, and network errors that indicate
-    the entire workspace is unreachable — not just a single model rate limit.
+    Catches 403/IP ACL blocks and auth failures that indicate the workspace
+    is permanently unreachable — not just a transient network hiccup.
+
+    Connection/network errors are NOT treated as workspace errors because they
+    can be transient and should be retried with backoff.
     """
     msg = str(exc).lower()
     return any(
@@ -86,13 +90,28 @@ def _is_workspace_error(exc: Exception) -> bool:
             "401",
             "authentication failed",
             "invalid token",
+            "token refresh",
+        ]
+    )
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Detect transient network/connection errors that should be retried."""
+    msg = str(exc).lower()
+    return any(
+        phrase in msg
+        for phrase in [
             "could not resolve host",
             "connection refused",
             "connection error",
             "network is unreachable",
             "name or service not known",
             "no such host",
-            "token refresh",
+            "connection reset",
+            "timeout",
+            "timed out",
+            "temporary failure",
+            "eof occurred",
         ]
     )
 
@@ -158,7 +177,7 @@ def _get_gateway_base_url() -> str | None:
     are created.
 
     Strips common API path suffixes (e.g. ``/chat/completions``) that users
-    might include by mistake — litellm appends its own path to the base URL.
+    might include by mistake.
     """
     url = os.environ.get("DATABRICKS_AI_GATEWAY_URL", "").strip()
     if not url:
@@ -171,24 +190,103 @@ def _get_gateway_base_url() -> str | None:
     return url.rstrip("/")
 
 
-def _to_litellm_model(model: str) -> tuple[str, str | None, str | None]:
-    """Convert a model string to (litellm_model, base_url, api_key) for completion calls.
+# ---------------------------------------------------------------------------
+# OpenAI client for Databricks Foundation Model APIs
+# ---------------------------------------------------------------------------
 
-    If AI Gateway is configured and model is a databricks/ model, routes
-    through the gateway as an OpenAI-compatible endpoint.  The OpenAI
-    provider in litellm does not auto-read ``DATABRICKS_TOKEN``, so we
-    pass it explicitly as ``api_key``.
+
+def _get_credentials_from_sdk() -> tuple[str, str]:
+    """Get host and token from Databricks SDK using saved DSE config or default profile.
 
     Returns:
-        (model_string, base_url_or_None, api_key_or_None)
+        (host, token) — host is the workspace URL, token is a fresh OAuth/PAT token.
     """
-    gateway = _get_gateway_base_url()
-    if gateway and model.startswith("databricks/"):
-        # Route through AI Gateway as OpenAI-compatible endpoint
+    # Try loading profile from saved DSE config first
+    profile = None
+    try:
+        from ..auth import load_config
+        ws_config = load_config()
+        if ws_config and ws_config.host:
+            profile = ws_config.profile
+    except Exception:
+        pass
+
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+        host = w.config.host.rstrip("/")
+        # config.token is None for OAuth (databricks-cli) auth — get it
+        # from the header factory which handles token refresh.
+        token = w.config.token
+        if not token:
+            headers = w.config.authenticate()
+            auth_header = headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[len("Bearer "):]
+        logger.info("LLM backend: credentials from Databricks SDK (profile=%s)", profile or "default")
+        return host, token
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot resolve Databricks credentials. Set DATABRICKS_HOST + DATABRICKS_TOKEN "
+            f"env vars, or configure a profile in ~/.databrickscfg. SDK error: {e}"
+        ) from e
+
+
+def _get_openai_client_and_model(model: str) -> tuple[Any, str]:
+    """Build an OpenAI client configured for the given model string.
+
+    Supports two routing modes:
+    1. AI Gateway: if DATABRICKS_AI_GATEWAY_URL is set, uses that as base_url.
+    2. Direct: constructs base_url from DATABRICKS_HOST or DATABRICKS_API_BASE,
+       appending /serving-endpoints if needed.
+
+    Falls back to the Databricks SDK (WorkspaceClient) for host and token
+    when environment variables are not set (e.g., when running inside the
+    MCP server process).
+
+    Args:
+        model: Model string like "databricks/databricks-claude-sonnet-4-6"
+
+    Returns:
+        (client, endpoint_name) where endpoint_name is the serving endpoint name.
+    """
+    from openai import OpenAI
+
+    # Extract endpoint name from "databricks/<endpoint>" format
+    if model.startswith("databricks/"):
         endpoint_name = model.split("/", 1)[1]
-        api_key = os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_API_KEY", "")
-        return f"openai/{endpoint_name}", gateway, api_key or None
-    return model, None, None
+    else:
+        endpoint_name = model
+
+    # Resolve credentials: env vars first, then Databricks SDK (OAuth/U2M)
+    api_key = (
+        os.environ.get("DATABRICKS_TOKEN")
+        or os.environ.get("DATABRICKS_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or ""
+    )
+    host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
+
+    if not api_key or not host:
+        sdk_host, sdk_token = _get_credentials_from_sdk()
+        if not host:
+            host = sdk_host
+        if not api_key:
+            api_key = sdk_token
+
+    # Determine base_url
+    gateway = _get_gateway_base_url()
+    if gateway:
+        base_url = gateway
+    else:
+        api_base = os.environ.get("DATABRICKS_API_BASE", "").rstrip("/")
+        if api_base:
+            base_url = api_base
+        else:
+            base_url = f"{host}/serving-endpoints"
+
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=180)
+    return client, endpoint_name
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +295,9 @@ def _to_litellm_model(model: str) -> tuple[str, str | None, str | None]:
 
 
 def completion_with_fallback(*, model: str, max_retries: int = 3, **kwargs) -> Any:
-    """Call litellm.completion with model fallback on rate limit errors.
+    """Call Databricks Foundation Model API with model fallback on rate limit errors.
+
+    Uses the OpenAI client pointed at Databricks serving endpoints.
 
     Tries the primary model first. On rate limit errors, cycles through
     the fallback chain. Each model gets ``max_retries`` attempts with
@@ -211,8 +311,6 @@ def completion_with_fallback(*, model: str, max_retries: int = 3, **kwargs) -> A
     Also supports AI Gateway: if DATABRICKS_AI_GATEWAY_URL is set,
     databricks/ models are routed through the gateway.
     """
-    import litellm
-
     if not _llm_budget.acquire():
         raise RuntimeError(
             f"GEPA LLM call budget exhausted ({_llm_budget.max_calls} calls). "
@@ -223,21 +321,17 @@ def completion_with_fallback(*, model: str, max_retries: int = 3, **kwargs) -> A
 
     last_err: Exception | None = None
     for model_str in models_to_try:
-        litellm_model, base_url, api_key = _to_litellm_model(model_str)
-
-        call_kwargs = dict(kwargs)
-        call_kwargs["model"] = litellm_model
-        if base_url:
-            call_kwargs["base_url"] = base_url
-        if api_key:
-            call_kwargs["api_key"] = api_key
+        client, endpoint_name = _get_openai_client_and_model(model_str)
 
         for attempt in range(max_retries):
             if attempt > 0:
                 delay = min(2**attempt, 30)
                 time.sleep(delay)
             try:
-                return litellm.completion(**call_kwargs)
+                return client.chat.completions.create(
+                    model=endpoint_name,
+                    **kwargs,
+                )
             except Exception as e:
                 last_err = e
                 # Workspace-level errors: fail fast, no fallback
@@ -255,8 +349,15 @@ def completion_with_fallback(*, model: str, max_retries: int = 3, **kwargs) -> A
                             max_retries,
                         )
                     continue
-                # Non-rate-limit error: don't retry, try next model
-                logger.warning("Model '%s' failed (non-rate-limit): %s", model_str, e)
+                # Transient connection errors: retry with backoff
+                if _is_transient_error(e):
+                    logger.warning(
+                        "Model '%s' transient error (attempt %d/%d): %s",
+                        model_str, attempt + 1, max_retries, e,
+                    )
+                    continue
+                # Non-retryable error: don't retry, try next model
+                logger.warning("Model '%s' failed (non-retryable): %s", model_str, e)
                 break
 
     raise last_err  # type: ignore[misc]

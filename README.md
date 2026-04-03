@@ -59,29 +59,77 @@ dse optimize ./my-skill --feedback eval/feedback.json --preset quick
 
 ## Quick Start — MCP Mode (Claude Code Skill)
 
-Add the skill-evaluator MCP server to your project's `.mcp.json`:
+### Step 1: Install and register
+
+```bash
+# Install the package
+pip install databricks-skill-evaluator
+
+# Register the MCP server in ~/.claude.json (auto-detects paths and credentials)
+dse setup --profile my-workspace
+```
+
+`dse setup` automatically:
+- Finds your Python interpreter and `run_server.py`
+- Reads your Databricks host from `~/.databrickscfg`
+- Gets a fresh auth token via `databricks auth token`
+- Writes the full MCP config (command, args, env) to `~/.claude.json`
+- Adds `mcp__skill-evaluator__*` to `~/.claude/settings.json` so all evaluation tools run without manual approval — no clicking "Allow" at each step
+
+> **Note**: OAuth tokens expire (~1 hour). Re-run `dse setup --profile my-workspace` to refresh. For long-lived access, use a [Personal Access Token](https://docs.databricks.com/en/dev-tools/auth/pat.html) and set it manually in `~/.claude.json` under `mcpServers.skill-evaluator.env.DATABRICKS_TOKEN`.
+
+### Step 2: Verify
+
+Restart Claude Code (exit and relaunch), then run:
+
+```
+/mcp
+```
+
+You should see `skill-evaluator · ✔ connected`.
+
+### Step 3: Run an evaluation
+
+Reference the SKILL.md to teach Claude the evaluation workflow, then ask it to evaluate:
+
+```
+@/path/to/databricks-skill-evaluator/SKILL.md evaluate my skill at /path/to/my-skill
+```
+
+Claude orchestrates the full evaluation:
+- Phase 0: Authenticate → Phase 1: Discover skill
+- Phase 2: L1 Unit Tests + L3 Static Eval (seconds, free/cheap)
+- Phase 3: L2 Integration + L4 Thinking + L5 Output (minutes, agent-based)
+- Phase 4: Generate HTML report with scores and recommendations
+
+### Step 4 (for agent-based levels): Databricks MCP server
+
+L2, L4, and L5 run real Claude agents that need Databricks MCP tools. Add a Databricks MCP server to `~/.claude.json` alongside the skill-evaluator if you don't already have one.
+
+<details>
+<summary>Manual setup (if dse setup doesn't work)</summary>
+
+Open `~/.claude.json` and add `skill-evaluator` inside the existing `"mcpServers"` object:
 
 ```json
-{
-  "mcpServers": {
-    "skill-evaluator": {
-      "command": "python",
-      "args": ["/path/to/databricks-skill-evaluator/run_server.py"]
-    },
-    "databricks": {
-      "command": "python",
-      "args": ["/path/to/databricks-mcp-server/run_server.py"]
-    }
+"skill-evaluator": {
+  "command": "/path/to/python",
+  "args": ["/path/to/databricks-skill-evaluator/run_server.py"],
+  "env": {
+    "DATABRICKS_CONFIG_PROFILE": "my-workspace",
+    "DATABRICKS_HOST": "https://my-workspace.cloud.databricks.com",
+    "DATABRICKS_TOKEN": "dapi..."
   }
 }
 ```
 
-Then install the `SKILL.md` as a Claude Code skill. Claude will automatically:
-1. Call `discover_skill` to parse your skill directory
-2. Call `run_unit_tests` and `run_static_eval` for quick feedback
-3. Show you per-criteria scores (1-10) and recommendations
-4. Offer to run agent-based levels (L2/L4/L5) for deeper analysis
-5. Call `generate_report` to create an HTML report
+Find your values:
+```bash
+python -c "import sys; print(sys.executable)"   # Python path
+databricks auth token --profile my-workspace     # Fresh token
+```
+
+</details>
 
 ### Available MCP Tools
 
@@ -235,6 +283,7 @@ The optimizer reads human feedback, runs mutations, evaluates each candidate wit
 ## CLI Reference
 
 ```
+dse setup      Register MCP server in ~/.claude.json (auto-detects paths + credentials)
 dse auth       Authenticate with Databricks and save config
 dse init       Initialize eval/ config for a skill directory
 dse evaluate   Run evaluation (--levels unit,static,integration,thinking,output,all)

@@ -27,6 +27,7 @@ class LevelResult:
     task_results: list[dict[str, Any]] | None = None
     artifacts: dict[str, str] | None = None
     metadata: dict[str, Any] | None = None
+    trace_ids: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -57,6 +58,7 @@ class LevelConfig:
     agent_timeout: int = 300
     judge_model: Optional[str] = None
     parallel_agents: int = 2
+    prior_results: dict[str, "LevelResult"] = field(default_factory=dict)
 
 
 class EvalLevel(ABC):

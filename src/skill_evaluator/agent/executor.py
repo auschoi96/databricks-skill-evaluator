@@ -80,6 +80,7 @@ class AgentResult:
     duration_ms: int | None = None
     success: bool = True
     error: str | None = None
+    mlflow_trace_id: str | None = None
 
 
 def _build_trace_metrics(
@@ -239,35 +240,22 @@ def _discover_mcp_tool_names(
     mcp_config: dict[str, Any],
     tool_modules: list[str] | None = None,
 ) -> list[str]:
-    """Discover MCP tool names, optionally filtered by module.
+    """Discover MCP tool names by statically parsing MCP server source code.
 
     Claude Code names MCP tools as ``mcp__<server>__<tool>``.  Uses
-    AST-based extraction from :func:`extract_tool_descriptions` so we
-    don't need to import (and thus *start*) the full MCP server just to
-    enumerate tool names.
-
-    When *tool_modules* is provided (e.g. ``["genie", "sql"]`` from
-    ``manifest.yaml``), only tools in those modules are returned.  This
-    keeps the ``allowed_tools`` list small and avoids hitting the Claude
-    CLI's JSON-message buffer limit with 70+ tool schemas.
+    AST-based extraction from :mod:`mcp_resolver` so we don't need to
+    import (and thus *start*) the full MCP server just to enumerate
+    tool names.
 
     Falls back to an empty list if extraction fails.
     """
-    tool_names: list[str] = []
-    for server_name in mcp_config:
-        try:
-            from ..optimize.tools import extract_tool_descriptions
+    from ..mcp_resolver import MCPConfig
 
-            tool_map = extract_tool_descriptions(modules=tool_modules)
-            for module_tools in tool_map.values():
-                for td in module_tools:
-                    tool_names.append(f"mcp__{server_name}__{td.name}")
-            logger.info(
-                "Discovered %d MCP tools for server '%s' (modules=%s)",
-                len(tool_names), server_name, tool_modules or "all",
-            )
-        except Exception as e:
-            logger.warning("Could not discover MCP tools for '%s': %s", server_name, e)
+    cfg = MCPConfig(servers=mcp_config)
+    cfg.resolve_available_tools()
+
+    tool_names = cfg.available_tools
+    logger.info("Discovered %d MCP tools from %d servers", len(tool_names), len(mcp_config))
     return tool_names
 
 
@@ -373,7 +361,38 @@ def _get_agent_env(
     for k in _skip_keys:
         env.pop(k, None)
 
-    # 3. Ensure required defaults
+    # 3. Fall back to Databricks SDK when host/token are missing (e.g. MCP server process)
+    if not env.get("DATABRICKS_HOST") or not env.get("DATABRICKS_TOKEN"):
+        try:
+            from ..auth import load_config
+            profile = None
+            ws_config = load_config()
+            if ws_config and ws_config.host:
+                profile = ws_config.profile
+
+            from databricks.sdk import WorkspaceClient
+            w = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+            sdk_host = w.config.host.rstrip("/")
+            # config.token is None for OAuth (databricks-cli) auth —
+            # get it from the header factory which handles token refresh.
+            sdk_token = w.config.token
+            if not sdk_token:
+                headers = w.config.authenticate()
+                auth_header = headers.get("Authorization", "")
+                if auth_header.startswith("Bearer "):
+                    sdk_token = auth_header[len("Bearer "):]
+
+            env.setdefault("DATABRICKS_HOST", sdk_host)
+            env.setdefault("DATABRICKS_TOKEN", sdk_token)
+            env.setdefault("ANTHROPIC_BASE_URL", f"{sdk_host}/anthropic")
+            env.setdefault("ANTHROPIC_AUTH_TOKEN", sdk_token)
+            if profile:
+                env.setdefault("DATABRICKS_CONFIG_PROFILE", profile)
+            logger.info("Agent env: credentials from Databricks SDK (profile=%s)", profile or "default")
+        except Exception as e:
+            logger.warning("Could not resolve Databricks credentials from SDK: %s", e)
+
+    # 4. Ensure required defaults
     env.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
     env.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "600000")  # 10 min
 
@@ -586,6 +605,16 @@ async def run_agent(
             success=False,
             error="claude-agent-sdk not installed. Install with: pip install claude-agent-sdk>=0.1.39",
         )
+
+    # Enable MLflow autolog for automatic Claude Code session tracing.
+    # This captures the full conversation (prompts, tool calls, results,
+    # token usage) as an MLflow trace — retrievable via MlflowClient.
+    # See: https://mlflow.org/docs/latest/genai/tracing/integrations/listing/claude_code
+    try:
+        import mlflow.anthropic
+        mlflow.anthropic.autolog()
+    except Exception as e:
+        logger.debug("mlflow.anthropic.autolog() not available: %s", e)
 
     session_id = str(uuid.uuid4())
     events: list[AgentEvent] = []
@@ -842,6 +871,17 @@ async def run_agent(
     response_text = "\n".join(response_parts)
     has_error = any(e.type == "error" for e in events)
 
+    # Capture the MLflow trace ID if autolog created one.
+    mlflow_trace_id = None
+    try:
+        import mlflow
+        last_trace = mlflow.get_last_active_trace()
+        if last_trace:
+            mlflow_trace_id = last_trace.info.trace_id
+            logger.info("MLflow trace captured: %s", mlflow_trace_id)
+    except Exception:
+        pass  # MLflow not available or no trace — fine
+
     return AgentResult(
         response_text=response_text,
         trace_metrics=trace_metrics,
@@ -850,6 +890,7 @@ async def run_agent(
         duration_ms=duration_ms,
         success=not has_error,
         error=next((e.data.get("message") for e in events if e.type == "error"), None),
+        mlflow_trace_id=mlflow_trace_id,
     )
 
 

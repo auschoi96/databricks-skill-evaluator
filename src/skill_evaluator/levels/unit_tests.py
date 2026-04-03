@@ -1,12 +1,12 @@
-"""Level 1: Unit Tests (#404) — Code block syntax validation.
+"""Level 1: Unit Tests (#404) — Code block syntax and tool availability validation.
 
 Validates that code examples in SKILL.md and reference files are
-syntactically correct, and runs any user-provided pytest tests.
+syntactically correct, checks that referenced MCP tools exist in the
+MCP server, and runs any user-provided pytest tests.
 """
 
 from __future__ import annotations
 
-import ast
 import logging
 import re
 import subprocess
@@ -14,9 +14,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from .base import EvalLevel, LevelConfig, LevelResult
+from .shared_validators import (
+    extract_code_blocks,
+    check_python_syntax,
+    check_sql_syntax,
+    check_yaml_syntax,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +44,11 @@ class UnitTestLevel(EvalLevel):
         all_content.update(config.skill.reference_files)
 
         for filename, content in all_content.items():
-            blocks = _extract_code_blocks(content)
+            blocks = extract_code_blocks(content)
             for i, (lang, code) in enumerate(blocks):
                 block_id = f"{filename}:block_{i+1}"
                 if lang in ("python", "py"):
-                    result = _check_python_syntax(code)
+                    result = check_python_syntax(code)
                     feedbacks.append({
                         "name": f"unit/python_syntax/{block_id}",
                         "value": "pass" if result["valid"] else "fail",
@@ -52,7 +56,7 @@ class UnitTestLevel(EvalLevel):
                         "source": "CODE",
                     })
                 elif lang in ("sql",):
-                    result = _check_sql_syntax(code)
+                    result = check_sql_syntax(code)
                     feedbacks.append({
                         "name": f"unit/sql_syntax/{block_id}",
                         "value": "pass" if result["valid"] else "fail",
@@ -60,7 +64,7 @@ class UnitTestLevel(EvalLevel):
                         "source": "CODE",
                     })
                 elif lang in ("yaml", "yml"):
-                    result = _check_yaml_syntax(code)
+                    result = check_yaml_syntax(code)
                     feedbacks.append({
                         "name": f"unit/yaml_syntax/{block_id}",
                         "value": "pass" if result["valid"] else "fail",
@@ -72,7 +76,11 @@ class UnitTestLevel(EvalLevel):
         link_results = _check_markdown_links(config.skill.path, all_content)
         feedbacks.extend(link_results)
 
-        # 3. Run pytest if eval/tests/ directory exists
+        # 3. Check that referenced MCP tools actually exist
+        tool_feedbacks = _check_tool_references(config)
+        feedbacks.extend(tool_feedbacks)
+
+        # 4. Run pytest if eval/tests/ directory exists
         test_dir = config.skill.path / "eval" / "tests"
         if test_dir.is_dir():
             pytest_results = _run_pytest(test_dir)
@@ -96,63 +104,6 @@ class UnitTestLevel(EvalLevel):
                 "syntax_errors": sum(1 for f in feedbacks if f["value"] == "fail"),
             },
         )
-
-
-def _extract_code_blocks(markdown: str) -> list[tuple[str, str]]:
-    """Extract fenced code blocks with their language from markdown."""
-    pattern = r"```(\w*)\n(.*?)```"
-    blocks = []
-    for match in re.finditer(pattern, markdown, re.DOTALL):
-        lang = match.group(1).lower() or "unknown"
-        code = match.group(2).strip()
-        if code:  # Skip empty blocks
-            blocks.append((lang, code))
-    return blocks
-
-
-def _check_python_syntax(code: str) -> dict[str, Any]:
-    """Validate Python syntax using ast.parse."""
-    try:
-        ast.parse(code)
-        return {"valid": True}
-    except SyntaxError as e:
-        return {"valid": False, "error": f"SyntaxError at line {e.lineno}: {e.msg}"}
-
-
-def _check_sql_syntax(code: str) -> dict[str, Any]:
-    """Basic SQL syntax validation.
-
-    Checks for balanced parentheses and common structural issues.
-    Not a full SQL parser — catches obvious errors.
-    """
-    # Check balanced parentheses
-    depth = 0
-    for char in code:
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-        if depth < 0:
-            return {"valid": False, "error": "Unbalanced parentheses: extra ')'"}
-
-    if depth != 0:
-        return {"valid": False, "error": f"Unbalanced parentheses: {depth} unclosed '('"}
-
-    # Check for common issues
-    stripped = code.strip()
-    if not stripped:
-        return {"valid": False, "error": "Empty SQL block"}
-
-    return {"valid": True}
-
-
-def _check_yaml_syntax(code: str) -> dict[str, Any]:
-    """Validate YAML syntax using yaml.safe_load."""
-    try:
-        yaml.safe_load(code)
-        return {"valid": True}
-    except yaml.YAMLError as e:
-        return {"valid": False, "error": f"YAML error: {e}"}
 
 
 def _check_markdown_links(skill_dir: Path, files: dict[str, str]) -> list[dict[str, Any]]:
@@ -182,6 +133,75 @@ def _check_markdown_links(skill_dir: Path, files: dict[str, str]) -> list[dict[s
                 "rationale": f"Link to '{link_target}' {'exists' if is_valid else 'not found'}",
                 "source": "CODE",
             })
+
+    return results
+
+
+def _check_tool_references(config) -> list[dict[str, Any]]:
+    """Check that MCP tools referenced in the skill actually exist.
+
+    Uses two sources of tool references:
+    1. Explicit mcp__server__tool patterns from skill content (strongest signal)
+    2. Bare tool names from skill_discovery that match known MCP tool suffixes
+
+    Gracefully skips if MCP config or available tools aren't populated.
+    """
+    results = []
+
+    if not config.mcp_config or not config.mcp_config.available_tools:
+        # Only emit skip if there are tool references to check
+        if config.skill.mcp_tool_references:
+            results.append({
+                "name": "unit/tool_available",
+                "value": "skip",
+                "rationale": "No MCP tools available for verification (MCP server not resolved)",
+                "source": "CODE",
+            })
+        return results
+
+    available = set(config.mcp_config.available_tools)
+    # Build a set of bare tool names (suffix after last __) for matching
+    available_bare = {t.split("__")[-1] for t in available if "__" in t}
+
+    all_content = config.skill.all_content
+    tools_to_check: dict[str, str] = {}  # display_name -> full_name_or_bare
+
+    # Source 1: Explicit mcp__server__tool patterns (highest confidence)
+    for match in re.finditer(r"mcp__(\w+)__(\w+)", all_content):
+        full_name = match.group(0)
+        bare_name = match.group(2)
+        tools_to_check[bare_name] = full_name
+
+    # Source 2: Bare tool names from skill_discovery that are actual MCP tools
+    # Only include names that exist in OR plausibly could be in the available set
+    # (i.e., they match the naming pattern of real tools — contain underscore)
+    for tool in config.skill.mcp_tool_references:
+        if tool in tools_to_check:
+            continue  # Already covered by Source 1
+        # Only check bare names that look like real tool names and exist
+        # in the available bare set. This filters out parameter names like
+        # "space_id", "warehouse_id" that the heuristic extractor picks up.
+        if tool in available_bare:
+            tools_to_check[tool] = tool
+
+    if not tools_to_check:
+        return results
+
+    for bare_name in sorted(tools_to_check):
+        full_or_bare = tools_to_check[bare_name]
+        if full_or_bare.startswith("mcp__"):
+            # Explicit reference — check exact match
+            found = full_or_bare in available
+        else:
+            # Bare name — check if any available tool ends with it
+            found = bare_name in available_bare
+
+        results.append({
+            "name": f"unit/tool_available/{bare_name}",
+            "value": "pass" if found else "fail",
+            "rationale": f"Tool '{bare_name}' {'found' if found else 'NOT found'} in MCP server",
+            "source": "CODE",
+        })
 
     return results
 

@@ -9,7 +9,7 @@ Generates a standalone HTML file with:
   - Aggregate score summary
   - Feedback textareas per task (exports to feedback.json via download)
 
-Inspired by Anthropic's skill-creator generate_review.py viewer.
+Uses SkillForge-inspired dark theme with 3-theme toggle.
 No server, no dependencies -- just a single HTML file.
 """
 
@@ -21,12 +21,14 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from ._styles import THEME_CSS, THEME_JS, SVG_ICONS, score_color, score_color_class
+
 logger = logging.getLogger(__name__)
 
 
 def _escape(text: str) -> str:
     """HTML-escape text."""
-    return html.escape(text, quote=True)
+    return html.escape(str(text), quote=True)
 
 
 def generate_report(
@@ -55,6 +57,13 @@ def generate_report(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # ── Task navigation pills ──
+    nav_pills = ""
+    for i, result in enumerate(task_results):
+        task_id = result.get("task_id", f"task-{i}")
+        nav_pills += f'<a href="#task-{i}" class="badge badge-neutral" style="cursor:pointer;text-decoration:none">{_escape(task_id)}</a> '
+
+    # ── Task cards ──
     task_cards = []
     for i, result in enumerate(task_results):
         task_id = result.get("task_id", f"task-{i}")
@@ -69,53 +78,61 @@ def generate_report(
         for a in assertions:
             cls = a.get("classification", "")
             passed = a.get("passed", False)
-            status_class = "pass" if passed else "fail"
-            badge_class = cls.lower().replace("_", "-") if cls else status_class
+            status_badge = f'<span class="badge badge-pass">&#10004;</span>' if passed else f'<span class="badge badge-fail">&#10008;</span>'
+
+            # Classification badge
+            cls_lower = cls.lower().replace("_", "-")
+            cls_badge = f'<span class="badge badge-{cls_lower}">{_escape(cls)}</span>' if cls else ""
 
             assertion_rows.append(f"""
-            <tr class="{status_class}">
-                <td>{'&#10004;' if passed else '&#10008;'}</td>
-                <td>{_escape(a.get('text', ''))}</td>
-                <td>{_escape(a.get('evidence', ''))}</td>
-                <td><span class="badge badge-{badge_class}">{_escape(cls)}</span></td>
+            <tr>
+                <td>{status_badge}</td>
+                <td style="font-size:11px">{_escape(a.get('text', ''))}</td>
+                <td style="font-size:11px">{_escape(a.get('evidence', ''))}</td>
+                <td>{cls_badge}</td>
             </tr>""")
 
         pass_rate = scores.get("pass_rate_with", 0)
         delta = scores.get("effectiveness_delta", 0)
+        pass_rate_cls = score_color_class(pass_rate)
+        delta_cls = "badge-pass" if delta > 0 else "badge-fail" if delta < 0 else "badge-neutral"
+
+        assertions_passed = sum(1 for a in assertions if a.get("passed"))
 
         task_cards.append(f"""
-        <div class="task-card" id="task-{i}">
-            <div class="task-header">
-                <h3>Task: {_escape(task_id)}</h3>
-                <div class="task-scores">
-                    <span class="score">Pass Rate: {pass_rate:.0%}</span>
-                    <span class="score delta-{'pos' if delta > 0 else 'neg' if delta < 0 else 'zero'}">
-                        Delta: {delta:+.2f}
-                    </span>
+        <div class="card" id="task-{i}" style="gap:12px;padding:16px">
+            <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:8px;border-bottom:1px solid var(--border)">
+                <span style="font-size:13px;font-weight:600;color:var(--text-primary)" class="mono">{_escape(task_id)}</span>
+                <div style="display:flex;gap:6px">
+                    <span class="badge badge-{pass_rate_cls}">Pass: {pass_rate:.0%}</span>
+                    <span class="badge {delta_cls}">Delta: {delta:+.2f}</span>
                 </div>
             </div>
 
-            <div class="prompt-box">
-                <h4>Prompt</h4>
+            <div>
+                <div class="section-title" style="margin-bottom:6px">Prompt</div>
                 <pre>{_escape(prompt)}</pre>
             </div>
 
-            <div class="responses">
-                <div class="response-col">
-                    <h4>WITH Skill</h4>
-                    <pre class="response">{_escape(with_response)}</pre>
-                </div>
-                <div class="response-col">
-                    <h4>WITHOUT Skill (baseline)</h4>
-                    <pre class="response">{_escape(without_response)}</pre>
+            <div>
+                <div class="section-title" style="margin-bottom:6px">Responses</div>
+                <div class="output-comparison">
+                    <div class="output-pane">
+                        <div class="output-pane-header"><span>WITH Skill</span></div>
+                        <div class="output-pane-content"><pre>{_escape(with_response)}</pre></div>
+                    </div>
+                    <div class="output-pane">
+                        <div class="output-pane-header"><span>WITHOUT Skill (baseline)</span></div>
+                        <div class="output-pane-content"><pre>{_escape(without_response)}</pre></div>
+                    </div>
                 </div>
             </div>
 
-            <div class="assertions-section">
-                <h4>Assertions ({sum(1 for a in assertions if a.get('passed'))}/{len(assertions)} passed)</h4>
-                <table class="assertions-table">
+            <div>
+                <div class="section-title" style="margin-bottom:6px">Assertions ({assertions_passed}/{len(assertions)} passed)</div>
+                <table>
                     <thead>
-                        <tr><th></th><th>Assertion</th><th>Evidence</th><th>Classification</th></tr>
+                        <tr><th style="width:40px"></th><th>Assertion</th><th>Evidence</th><th style="width:110px">Classification</th></tr>
                     </thead>
                     <tbody>
                         {''.join(assertion_rows)}
@@ -123,8 +140,8 @@ def generate_report(
                 </table>
             </div>
 
-            <div class="feedback-section">
-                <h4>Feedback</h4>
+            <div>
+                <div class="section-title" style="margin-bottom:6px">Feedback</div>
                 <select class="verdict-select" data-task="{_escape(task_id)}">
                     <option value="">-- Select --</option>
                     <option value="good">Good</option>
@@ -132,119 +149,80 @@ def generate_report(
                     <option value="regression">Regression</option>
                 </select>
                 <textarea class="feedback-text" data-task="{_escape(task_id)}"
-                    placeholder="Notes on this test case (optional)..."></textarea>
+                    placeholder="Notes on this test case (optional)..." style="margin-top:6px"></textarea>
             </div>
         </div>""")
 
-    # Aggregate summary
+    # ── Aggregate summary ──
     agg_html = ""
     if aggregate_scores:
-        agg_items = "".join(
-            f"<tr><td>{_escape(k)}</td><td>{v:.3f}</td></tr>"
-            for k, v in aggregate_scores.items()
-        )
+        agg_cards = ""
+        for k, v in aggregate_scores.items():
+            cls = score_color_class(v) if 0 <= v <= 1 else ""
+            agg_cards += f"""
+            <div class="card">
+                <div class="card-title" style="font-size:11px">{_escape(k.replace('_', ' ').title())}</div>
+                <div class="hero-metric{' color-' + cls if cls else ''}" style="font-size:22px">{v:.3f}</div>
+            </div>"""
         agg_html = f"""
-        <div class="aggregate-summary">
-            <h3>Aggregate Scores</h3>
-            <table class="summary-table">
-                <thead><tr><th>Metric</th><th>Value</th></tr></thead>
-                <tbody>{agg_items}</tbody>
-            </table>
+        <div class="section">
+            <div class="section-title">Aggregate Scores</div>
+            <div class="metric-grid">{agg_cards}</div>
         </div>"""
 
     html_content = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dbx-dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark light">
 <title>Skill Evaluation: {_escape(skill_name)}</title>
-<style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-           background: #f5f5f5; color: #333; padding: 20px; max-width: 1400px; margin: 0 auto; }}
-    h1 {{ margin-bottom: 10px; }}
-    h3 {{ margin-bottom: 8px; }}
-    h4 {{ margin-bottom: 6px; color: #555; }}
-    .header {{ margin-bottom: 20px; padding: 20px; background: white; border-radius: 8px;
-               box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-    .task-card {{ background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px;
-                  box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-    .task-header {{ display: flex; justify-content: space-between; align-items: center;
-                    margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #eee; }}
-    .task-scores {{ display: flex; gap: 15px; }}
-    .score {{ font-weight: 600; padding: 4px 10px; border-radius: 4px; background: #f0f0f0; }}
-    .delta-pos {{ color: #16a34a; background: #f0fdf4; }}
-    .delta-neg {{ color: #dc2626; background: #fef2f2; }}
-    .delta-zero {{ color: #666; }}
-    .prompt-box {{ margin-bottom: 15px; }}
-    .prompt-box pre {{ background: #f8f9fa; padding: 12px; border-radius: 6px; white-space: pre-wrap;
-                       word-wrap: break-word; font-size: 13px; }}
-    .responses {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px; }}
-    .response {{ background: #f8f9fa; padding: 12px; border-radius: 6px; white-space: pre-wrap;
-                 word-wrap: break-word; font-size: 12px; max-height: 400px; overflow-y: auto; }}
-    .assertions-table {{ width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 13px; }}
-    .assertions-table th {{ text-align: left; padding: 8px; background: #f8f9fa; border-bottom: 2px solid #ddd; }}
-    .assertions-table td {{ padding: 8px; border-bottom: 1px solid #eee; }}
-    .assertions-table tr.pass td:first-child {{ color: #16a34a; font-weight: bold; }}
-    .assertions-table tr.fail td:first-child {{ color: #dc2626; font-weight: bold; }}
-    .badge {{ padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }}
-    .badge-positive {{ background: #dcfce7; color: #16a34a; }}
-    .badge-regression {{ background: #fef2f2; color: #dc2626; }}
-    .badge-needs-skill {{ background: #fef9c3; color: #a16207; }}
-    .badge-neutral {{ background: #f0f0f0; color: #666; }}
-    .badge-pass {{ background: #dcfce7; color: #16a34a; }}
-    .badge-fail {{ background: #fef2f2; color: #dc2626; }}
-    .feedback-section {{ margin-top: 10px; }}
-    .verdict-select {{ padding: 6px; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 8px; }}
-    .feedback-text {{ width: 100%; height: 60px; padding: 8px; border: 1px solid #ddd; border-radius: 6px;
-                      font-family: inherit; font-size: 13px; resize: vertical; }}
-    .summary-table {{ border-collapse: collapse; }}
-    .summary-table th, .summary-table td {{ padding: 6px 12px; border: 1px solid #ddd; }}
-    .aggregate-summary {{ margin-bottom: 20px; }}
-    .export-btn {{ padding: 10px 20px; background: #2563eb; color: white; border: none; border-radius: 6px;
-                   font-size: 14px; cursor: pointer; margin-top: 10px; }}
-    .export-btn:hover {{ background: #1d4ed8; }}
-    .nav-buttons {{ display: flex; gap: 8px; margin-bottom: 15px; }}
-    .nav-btn {{ padding: 6px 12px; background: #e5e7eb; border: none; border-radius: 4px; cursor: pointer; }}
-    .nav-btn:hover {{ background: #d1d5db; }}
-</style>
+<style>{THEME_CSS}</style>
 </head>
 <body>
-<div class="header">
-    <h1>Skill Evaluation: {_escape(skill_name)}</h1>
-    <p>{len(task_results)} test cases evaluated</p>
-    {agg_html}
-    <button class="export-btn" onclick="exportFeedback()">Save Feedback</button>
+{SVG_ICONS}
+<script>{THEME_JS}</script>
+
+<div class="top-bar">
+    <span class="top-bar-title">Skill Evaluation: {_escape(skill_name)}</span>
+    <span style="font-size:12px;color:var(--text-muted)">{len(task_results)} test cases</span>
+    <span style="flex:1"></span>
+    <button class="btn-primary" onclick="exportFeedback()">Save Feedback</button>
+    <button id="theme-toggle" class="btn-secondary" onclick="toggleTheme()">DBX Dark</button>
+</div>
+
+{agg_html}
+
+<div style="display:flex;gap:4px;flex-wrap:wrap;padding:8px 0;position:sticky;top:44px;z-index:10;background:var(--bg-l0)">
+    {nav_pills}
 </div>
 
 {''.join(task_cards)}
 
 <script>
 function exportFeedback() {{
-    const feedback = [];
-    document.querySelectorAll('.task-card').forEach(card => {{
-        const textarea = card.querySelector('.feedback-text');
-        const select = card.querySelector('.verdict-select');
-        const taskId = textarea.dataset.task;
-        const notes = textarea.value.trim();
-        const verdict = select.value;
+    var feedback = [];
+    document.querySelectorAll('.card[id^="task-"]').forEach(function(card) {{
+        var textarea = card.querySelector('.feedback-text');
+        var select = card.querySelector('.verdict-select');
+        var taskId = textarea.dataset.task;
+        var notes = textarea.value.trim();
+        var verdict = select.value;
         if (notes || verdict) {{
             feedback.push({{ task_id: taskId, notes: notes, verdict: verdict, suggested_changes: '' }});
         }}
     }});
 
-    const blob = new Blob([JSON.stringify(feedback, null, 2)], {{ type: 'application/json' }});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
+    var blob = new Blob([JSON.stringify(feedback, null, 2)], {{ type: 'application/json' }});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
     a.href = url;
     a.download = 'feedback.json';
     a.click();
     URL.revokeObjectURL(url);
 }}
 
-// Keyboard navigation
-document.addEventListener('keydown', (e) => {{
-    const cards = document.querySelectorAll('.task-card');
+document.addEventListener('keydown', function(e) {{
     if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {{
         // find next card
     }}

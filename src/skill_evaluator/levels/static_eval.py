@@ -3,6 +3,10 @@
 Evaluates the SKILL.md document itself against a rubric of 10 criteria
 without executing the skill. Deterministic checks run first (zero LLM cost),
 then an LLM judge evaluates semantic dimensions.
+
+When L1 (unit tests) has already run, deterministic scores for tool_accuracy
+and examples_valid are derived from L1 results to avoid duplicate work.
+When L3 runs standalone (e.g., via MCP tool), it runs its own checks.
 """
 
 from __future__ import annotations
@@ -13,7 +17,12 @@ import re
 from typing import Any
 
 from .base import EvalLevel, LevelConfig, LevelResult
-from .unit_tests import _extract_code_blocks, _check_python_syntax, _check_sql_syntax
+from .shared_validators import (
+    extract_code_blocks,
+    check_python_syntax,
+    check_sql_syntax,
+    check_yaml_syntax,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,19 +158,17 @@ class StaticEvalLevel(EvalLevel):
         dimension_scores: dict[str, float] = {}
 
         # Phase 1: Deterministic checks (zero LLM cost)
+        # Reuse L1 results when available to avoid duplicate work
         logger.info("Running deterministic checks...")
 
-        # Check tool accuracy
         tool_score, tool_feedbacks = self._check_tool_accuracy(config)
         feedbacks.extend(tool_feedbacks)
         dimension_scores["tool_accuracy"] = tool_score
 
-        # Check examples validity
         example_score, example_feedbacks = self._check_examples_valid(config)
         feedbacks.extend(example_feedbacks)
         dimension_scores["examples_valid"] = example_score
 
-        # Check security (deterministic part)
         security_feedbacks = self._check_security_deterministic(config)
         feedbacks.extend(security_feedbacks)
 
@@ -182,31 +189,64 @@ class StaticEvalLevel(EvalLevel):
             elif f.get("value") == "fail" and f.get("source") == "CODE":
                 recommendations.append(f"{f.get('name', '')}: {rationale}")
 
-        # Compute overall score (average of all dimensions on 1-10 scale, normalized to 0-1)
+        # Compute overall score with coverage factor
+        # When fewer dimensions are evaluated (e.g., LLM unavailable),
+        # the score is penalized proportionally to prevent inflation.
         if dimension_scores:
             overall_score_raw = sum(dimension_scores.values()) / len(dimension_scores)
-            score = overall_score_raw / 10.0  # Normalize from 1-10 to 0-1
+            coverage_factor = len(dimension_scores) / len(STATIC_EVAL_DIMENSIONS)
+            score = (overall_score_raw / 10.0) * coverage_factor
         else:
             overall_score_raw = 0.0
+            coverage_factor = 0.0
             score = 0.0
+
+        metadata: dict[str, Any] = {
+            "overall_score": round(overall_score_raw, 1),
+            "criteria": dimension_scores,
+            "recommendations": recommendations,
+            "dimensions_evaluated": len(dimension_scores),
+            "dimensions_total": len(STATIC_EVAL_DIMENSIONS),
+            "coverage_factor": round(coverage_factor, 2),
+        }
+
+        # Flag if LLM dimensions were skipped
+        llm_skipped = any(
+            f.get("value") == "skip" and f.get("source") == "LLM_JUDGE"
+            for f in feedbacks
+        )
+        if llm_skipped:
+            metadata["llm_skipped"] = True
 
         return LevelResult(
             level=self.name,
             score=score,
             feedbacks=feedbacks,
-            metadata={
-                "overall_score": round(overall_score_raw, 1),
-                "criteria": dimension_scores,
-                "recommendations": recommendations,
-                "dimensions_evaluated": len(dimension_scores),
-            },
+            metadata=metadata,
         )
 
     def _check_tool_accuracy(self, config: LevelConfig) -> tuple[float, list[dict]]:
-        """Check that referenced MCP tools actually exist."""
-        feedbacks = []
-        if not config.mcp_config or not config.mcp_config.available_tools:
-            # Can't verify — give neutral score
+        """Check that referenced MCP tools actually exist.
+
+        Reuses L1 results when available (orchestrator mode) to avoid
+        running the same check twice. Falls back to L1's thorough
+        tool reference checker when running standalone.
+        """
+        # Reuse L1 results if available
+        l1_result = config.prior_results.get("unit")
+        if l1_result:
+            return self._derive_tool_score_from_l1(l1_result)
+
+        # Standalone mode: use L1's thorough tool reference checker
+        from .unit_tests import _check_tool_references
+
+        tool_feedbacks = _check_tool_references(config)
+
+        if not tool_feedbacks:
+            return 10.0, []
+
+        # Check for skip (no MCP tools available)
+        if all(f.get("value") == "skip" for f in tool_feedbacks):
             return 5.0, [{
                 "name": "static/tool_accuracy",
                 "value": "skip",
@@ -214,27 +254,67 @@ class StaticEvalLevel(EvalLevel):
                 "source": "CODE",
             }]
 
-        available = set(config.mcp_config.available_tools)
-        referenced = config.skill.mcp_tool_references
-        missing = [t for t in referenced if t not in available and f"mcp__databricks__{t}" not in available]
+        total = sum(1 for f in tool_feedbacks if f["value"] in ("pass", "fail"))
+        passed = sum(1 for f in tool_feedbacks if f["value"] == "pass")
+        score = (passed / total * 10.0) if total > 0 else 10.0
 
-        for tool in referenced:
-            found = tool in available or f"mcp__databricks__{tool}" in available
-            feedbacks.append({
-                "name": f"static/tool_accuracy/{tool}",
-                "value": "pass" if found else "fail",
-                "rationale": f"Tool '{tool}' {'found' if found else 'NOT found'} in MCP server",
-                "source": "CODE",
+        # Re-label feedbacks for static namespace
+        static_feedbacks = []
+        for f in tool_feedbacks:
+            static_feedbacks.append({
+                **f,
+                "name": f["name"].replace("unit/tool_available/", "static/tool_accuracy/"),
             })
 
-        if not referenced:
-            return 10.0, feedbacks
+        return max(1.0, score), static_feedbacks
 
-        score = (len(referenced) - len(missing)) / len(referenced) * 10.0
-        return max(1.0, score), feedbacks
+    def _derive_tool_score_from_l1(self, l1_result) -> tuple[float, list[dict]]:
+        """Derive tool_accuracy score from L1's tool reference feedbacks."""
+        tool_feedbacks = [
+            f for f in l1_result.feedbacks
+            if f.get("name", "").startswith("unit/tool_available")
+        ]
+
+        if not tool_feedbacks:
+            return 10.0, [{
+                "name": "static/tool_accuracy",
+                "value": "pass",
+                "rationale": "No tool references to check (derived from L1)",
+                "source": "CODE",
+            }]
+
+        if all(f.get("value") == "skip" for f in tool_feedbacks):
+            return 5.0, [{
+                "name": "static/tool_accuracy",
+                "value": "skip",
+                "rationale": "No MCP tools available for verification (derived from L1)",
+                "source": "CODE",
+            }]
+
+        total = sum(1 for f in tool_feedbacks if f["value"] in ("pass", "fail"))
+        passed = sum(1 for f in tool_feedbacks if f["value"] == "pass")
+        score = (passed / total * 10.0) if total > 0 else 10.0
+
+        return max(1.0, score), [{
+            "name": "static/tool_accuracy",
+            "value": "pass" if score >= 6.0 else "fail",
+            "rationale": f"Derived from L1: {passed}/{total} tools verified. Score: {score:.1f}/10",
+            "source": "CODE",
+        }]
 
     def _check_examples_valid(self, config: LevelConfig) -> tuple[float, list[dict]]:
-        """Check that code examples are syntactically valid."""
+        """Check that code examples are syntactically valid.
+
+        Reuses L1 results when available (orchestrator mode) to avoid
+        running the same check twice. Falls back to running checks
+        directly when standalone. Validates Python, SQL, and YAML.
+        """
+        # Reuse L1 results if available
+        l1_result = config.prior_results.get("unit")
+        if l1_result:
+            return self._derive_examples_score_from_l1(l1_result)
+
+        # Standalone mode: run checks directly
         feedbacks = []
         all_content = {"SKILL.md": config.skill.skill_md_content}
         all_content.update(config.skill.reference_files)
@@ -242,10 +322,10 @@ class StaticEvalLevel(EvalLevel):
         total = 0
         passed = 0
         for filename, content in all_content.items():
-            blocks = _extract_code_blocks(content)
+            blocks = extract_code_blocks(content)
             for i, (lang, code) in enumerate(blocks):
                 if lang in ("python", "py"):
-                    result = _check_python_syntax(code)
+                    result = check_python_syntax(code)
                     total += 1
                     if result["valid"]:
                         passed += 1
@@ -256,13 +336,56 @@ class StaticEvalLevel(EvalLevel):
                         "source": "CODE",
                     })
                 elif lang == "sql":
-                    result = _check_sql_syntax(code)
+                    result = check_sql_syntax(code)
                     total += 1
                     if result["valid"]:
                         passed += 1
+                    feedbacks.append({
+                        "name": f"static/examples_valid/{filename}:block_{i+1}",
+                        "value": "pass" if result["valid"] else "fail",
+                        "rationale": result.get("error", "Valid syntax"),
+                        "source": "CODE",
+                    })
+                elif lang in ("yaml", "yml"):
+                    result = check_yaml_syntax(code)
+                    total += 1
+                    if result["valid"]:
+                        passed += 1
+                    feedbacks.append({
+                        "name": f"static/examples_valid/{filename}:block_{i+1}",
+                        "value": "pass" if result["valid"] else "fail",
+                        "rationale": result.get("error", "Valid syntax"),
+                        "source": "CODE",
+                    })
 
         score = (passed / total * 10.0) if total > 0 else 10.0
         return max(1.0, score), feedbacks
+
+    def _derive_examples_score_from_l1(self, l1_result) -> tuple[float, list[dict]]:
+        """Derive examples_valid score from L1's syntax validation feedbacks."""
+        syntax_feedbacks = [
+            f for f in l1_result.feedbacks
+            if f.get("name", "").startswith(("unit/python_syntax/", "unit/sql_syntax/", "unit/yaml_syntax/"))
+        ]
+
+        if not syntax_feedbacks:
+            return 10.0, [{
+                "name": "static/examples_valid",
+                "value": "pass",
+                "rationale": "No code blocks to validate (derived from L1)",
+                "source": "CODE",
+            }]
+
+        total = len(syntax_feedbacks)
+        passed = sum(1 for f in syntax_feedbacks if f["value"] == "pass")
+        score = (passed / total * 10.0) if total > 0 else 10.0
+
+        return max(1.0, score), [{
+            "name": "static/examples_valid",
+            "value": "pass" if score >= 6.0 else "fail",
+            "rationale": f"Derived from L1: {passed}/{total} code blocks valid. Score: {score:.1f}/10",
+            "source": "CODE",
+        }]
 
     def _check_security_deterministic(self, config: LevelConfig) -> list[dict]:
         """Scan for hardcoded secrets and credentials."""
@@ -301,11 +424,19 @@ class StaticEvalLevel(EvalLevel):
         self, config: LevelConfig, precheck_feedbacks: list[dict]
     ) -> tuple[list[dict], dict[str, float]]:
         """Run LLM judge for semantic evaluation dimensions."""
+        llm_dimensions = [
+            d for d in STATIC_EVAL_DIMENSIONS
+            if d["type"] in ("llm", "hybrid")
+        ]
+
         try:
             from ..grading.llm_backend import completion_with_fallback
         except ImportError:
             logger.warning("LLM backend not available — skipping semantic evaluation")
-            return [], {}
+            return self._skip_llm_dimensions(
+                llm_dimensions,
+                "LLM backend unavailable (openai not installed). Install with: pip install openai",
+            )
 
         # Format precheck results for the prompt
         precheck_text = "\n".join(
@@ -344,13 +475,19 @@ class StaticEvalLevel(EvalLevel):
             json_match = re.search(r"\[.*\]", content, re.DOTALL)
             if not json_match:
                 logger.warning("LLM judge did not return valid JSON")
-                return [], {}
+                return self._skip_llm_dimensions(
+                    llm_dimensions,
+                    "LLM judge returned invalid response (no JSON array found)",
+                )
 
             dimensions = json.loads(json_match.group())
 
         except Exception as e:
             logger.error(f"LLM judge failed: {e}")
-            return [], {}
+            return self._skip_llm_dimensions(
+                llm_dimensions,
+                f"LLM judge call failed: {e}",
+            )
 
         feedbacks = []
         scores = {}
@@ -371,3 +508,17 @@ class StaticEvalLevel(EvalLevel):
             })
 
         return feedbacks, scores
+
+    def _skip_llm_dimensions(
+        self, dimensions: list[dict], reason: str
+    ) -> tuple[list[dict], dict[str, float]]:
+        """Generate skip feedbacks when LLM evaluation cannot run."""
+        feedbacks = []
+        for dim in dimensions:
+            feedbacks.append({
+                "name": f"static/{dim['id']}",
+                "value": "skip",
+                "rationale": reason,
+                "source": "LLM_JUDGE",
+            })
+        return feedbacks, {}

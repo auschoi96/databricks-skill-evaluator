@@ -56,6 +56,109 @@ Return JSON:
 ]
 ```"""
 
+# Maximum characters for the transcript in the judge prompt.
+# A typical agent session is 5-20 turns; 15K chars is enough for
+# comprehensive tool_use/result pairs plus reasoning text while
+# staying well within the model context window.
+_TRANSCRIPT_BUDGET = 15_000
+
+# Per-field truncation limits for individual event data.
+_TOOL_INPUT_LIMIT = 1000
+_TOOL_RESULT_LIMIT = 1000
+_TEXT_BLOCK_LIMIT = 2000
+
+
+def _build_comprehensive_transcript(events: list, budget: int = _TRANSCRIPT_BUDGET) -> str:
+    """Build a structured, human-readable transcript from agent events.
+
+    Groups events by turn and formats them so the LLM judge can assess:
+    - THINKING: agent reasoning text (critical for clarity scoring)
+    - TOOL_USE → TOOL_RESULT pairs (critical for efficiency/recovery scoring)
+    - ERROR markers (critical for recovery scoring)
+    - Per-turn token usage (supports efficiency scoring)
+    """
+    if not events:
+        return "(no events captured)"
+
+    lines: list[str] = []
+    turn_num = 0
+    # Map tool_use IDs to their names for pairing with results
+    pending_tools: dict[str, str] = {}
+
+    for event in events:
+        etype = getattr(event, "type", "") if hasattr(event, "type") else str(event)
+        data = getattr(event, "data", {}) if hasattr(event, "data") else {}
+
+        if etype == "assistant_turn":
+            turn_num += 1
+            usage = data.get("usage", {})
+            inp = usage.get("input_tokens", 0)
+            out = usage.get("output_tokens", 0)
+            lines.append(f"\n{'=' * 40}")
+            lines.append(f"TURN {turn_num}  (tokens: input={inp} output={out})")
+            lines.append("=" * 40)
+
+        elif etype == "text":
+            text = data.get("text", "")
+            if text.strip():
+                truncated = text[:_TEXT_BLOCK_LIMIT]
+                if len(text) > _TEXT_BLOCK_LIMIT:
+                    truncated += f"... [{len(text) - _TEXT_BLOCK_LIMIT} chars truncated]"
+                lines.append(f"\n[THINKING] {truncated}")
+
+        elif etype == "tool_use":
+            tool_name = data.get("name", "unknown_tool")
+            tool_id = data.get("id", "")
+            tool_input = data.get("input", {})
+            pending_tools[tool_id] = tool_name
+
+            input_str = json.dumps(tool_input, default=str)
+            if len(input_str) > _TOOL_INPUT_LIMIT:
+                input_str = input_str[:_TOOL_INPUT_LIMIT] + "..."
+            lines.append(f"\n[TOOL_USE] {tool_name}")
+            lines.append(f"  Input: {input_str}")
+
+        elif etype == "tool_result":
+            tool_id = data.get("tool_use_id", "")
+            is_error = data.get("is_error", False)
+            content = data.get("content", "")
+
+            tool_name = pending_tools.pop(tool_id, "unknown_tool")
+            status = "ERROR" if is_error else "SUCCESS"
+
+            # Extract meaningful content from tool result
+            result_str = str(content) if content else "(empty)"
+            if len(result_str) > _TOOL_RESULT_LIMIT:
+                result_str = result_str[:_TOOL_RESULT_LIMIT] + "..."
+
+            prefix = "[ERROR]" if is_error else "[TOOL_RESULT]"
+            lines.append(f"{prefix} {status} ({tool_name})")
+            lines.append(f"  {result_str}")
+
+        elif etype == "error":
+            msg = data.get("message", str(data))
+            lines.append(f"\n[ERROR] {msg}")
+
+        elif etype == "system":
+            subtype = data.get("subtype", "")
+            if subtype:
+                lines.append(f"\n[SYSTEM] {subtype}")
+
+    transcript = "\n".join(lines)
+
+    # Trim to budget, preserving complete lines
+    if len(transcript) > budget:
+        # Keep the beginning (shows initial approach) and end (shows completion)
+        half = budget // 2
+        head = transcript[:half]
+        tail = transcript[-half:]
+        # Cut at line boundaries
+        head = head[:head.rfind("\n")] if "\n" in head else head
+        tail = tail[tail.find("\n") + 1:] if "\n" in tail else tail
+        transcript = head + f"\n\n... [{len(transcript) - budget} chars omitted] ...\n\n" + tail
+
+    return transcript
+
 
 class ThinkingEvalLevel(EvalLevel):
     """Evaluate agent reasoning quality from execution traces."""
@@ -85,6 +188,7 @@ class ThinkingEvalLevel(EvalLevel):
 
         feedbacks: list[dict[str, Any]] = []
         task_results: list[dict[str, Any]] = []
+        trace_ids: list[str] = []
 
         test_cases = config.test_instructions.ground_truth
         if not test_cases:
@@ -127,6 +231,10 @@ class ThinkingEvalLevel(EvalLevel):
                 )
                 feedbacks.extend(llm_feedbacks)
 
+                # Capture MLflow trace ID for assessment logging
+                if result.mlflow_trace_id:
+                    trace_ids.append(result.mlflow_trace_id)
+
                 task_results.append({
                     "task_id": case_id,
                     "prompt": prompt,
@@ -135,6 +243,7 @@ class ThinkingEvalLevel(EvalLevel):
                         "tool_calls": result.trace_metrics.total_tool_calls if result.trace_metrics else 0,
                         "tokens": result.trace_metrics.total_tokens if result.trace_metrics else 0,
                     },
+                    "mlflow_trace_id": result.mlflow_trace_id,
                 })
 
             except Exception as e:
@@ -146,14 +255,16 @@ class ThinkingEvalLevel(EvalLevel):
                     "source": "CODE",
                 })
 
-        # Compute overall score
-        all_scores = [
-            f for f in feedbacks
-            if f.get("source") == "LLM_JUDGE" and f["value"] != "skip"
-        ]
-        if all_scores:
-            pass_rate = sum(1 for f in all_scores if f["value"] == "pass") / len(all_scores)
-            score = pass_rate
+        # Compute overall score from actual dimension scores (1-5 scale),
+        # normalized to 0-1.  This preserves granularity — a test scoring
+        # 5/5/5/5 is meaningfully different from 3/3/3/3.
+        all_dim_scores: list[float] = []
+        for tr in task_results:
+            for dim_score in tr.get("dimension_scores", {}).values():
+                all_dim_scores.append(float(dim_score))
+
+        if all_dim_scores:
+            score = sum(all_dim_scores) / (len(all_dim_scores) * 5)
         else:
             score = 0.0
 
@@ -162,53 +273,28 @@ class ThinkingEvalLevel(EvalLevel):
             score=score,
             feedbacks=feedbacks,
             task_results=task_results,
+            trace_ids=trace_ids,
         )
 
     def _score_trace(self, case, result) -> list[dict[str, Any]]:
         """Run deterministic trace scorers."""
-        feedbacks = []
+        from .shared_validators import check_trace_expectations
+
         trace = result.trace_metrics
         if not trace:
-            return feedbacks
+            return []
 
-        expectations = (case.expectations or {}).get("trace_expectations", {})
+        # Shared checks: required_tools, banned_tools, tool_limits
+        feedbacks = check_trace_expectations(
+            case_id=case.id,
+            trace=trace,
+            expectations=case.expectations or {},
+            level_prefix="thinking",
+        )
 
-        # Required tools check
-        required = expectations.get("required_tools", [])
-        for tool in required:
-            found = trace.has_tool(tool)
-            feedbacks.append({
-                "name": f"thinking/{case.id}/required_tool/{tool}",
-                "value": "pass" if found else "fail",
-                "rationale": f"Required tool '{tool}' {'used' if found else 'NOT used'}",
-                "source": "CODE",
-            })
-
-        # Banned tools check
-        banned = expectations.get("banned_tools", [])
-        for tool in banned:
-            used = trace.has_tool(tool)
-            feedbacks.append({
-                "name": f"thinking/{case.id}/banned_tool/{tool}",
-                "value": "pass" if not used else "fail",
-                "rationale": f"Banned tool '{tool}' {'NOT used (good)' if not used else 'was USED'}",
-                "source": "CODE",
-            })
-
-        # Tool limits
-        limits = expectations.get("tool_limits", {})
-        for tool_name, max_count in limits.items():
-            actual = trace.get_tool_count(tool_name)
-            within = actual <= max_count
-            feedbacks.append({
-                "name": f"thinking/{case.id}/tool_limit/{tool_name}",
-                "value": "pass" if within else "fail",
-                "rationale": f"Tool '{tool_name}': {actual} calls (limit: {max_count})",
-                "source": "CODE",
-            })
-
-        # Token budget
-        token_budget = expectations.get("token_budget", {})
+        # L4-only: token budget check
+        trace_exp = (case.expectations or {}).get("trace_expectations", {})
+        token_budget = trace_exp.get("token_budget", {})
         max_total = token_budget.get("max_total")
         if max_total:
             actual = trace.total_tokens
@@ -232,15 +318,18 @@ class ThinkingEvalLevel(EvalLevel):
             return [], {}
 
         trace = result.trace_metrics
-        # Build transcript text from events
-        transcript_text = ""
-        if hasattr(result, "events") and result.events:
-            for event in result.events[:50]:  # Limit to 50 events
-                transcript_text += f"[{event.type}] {str(event.data)[:500]}\n"
-        elif hasattr(result, "response_text"):
-            transcript_text = result.response_text[:3000]
 
-        # Detect errors in transcript
+        # Build comprehensive transcript from events (primary path).
+        # Includes agent reasoning text, structured tool_use→result pairs,
+        # error markers, and per-turn token usage.
+        if hasattr(result, "events") and result.events:
+            transcript_text = _build_comprehensive_transcript(result.events)
+        elif hasattr(result, "response_text"):
+            transcript_text = result.response_text[:_TRANSCRIPT_BUDGET]
+        else:
+            transcript_text = "(no transcript available)"
+
+        # Detect errors in trace for the summary section
         errors = []
         if trace:
             for tc in trace.tool_calls:
@@ -250,7 +339,7 @@ class ThinkingEvalLevel(EvalLevel):
         judge_prompt = _THINKING_JUDGE_PROMPT.format(
             prompt=prompt,
             thinking_instructions=thinking_instructions,
-            transcript=transcript_text[:5000],
+            transcript=transcript_text,
             total_tool_calls=trace.total_tool_calls if trace else "unknown",
             tool_counts=json.dumps(trace.tool_counts if trace else {}),
             total_tokens=trace.total_tokens if trace else "unknown",

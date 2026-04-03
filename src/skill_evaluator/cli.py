@@ -61,6 +61,128 @@ def auth(profile: str, catalog: str, schema: str, warehouse_id: str, experiment:
 
 
 @main.command()
+@click.option("--profile", default="DEFAULT", help="Databricks config profile from ~/.databrickscfg")
+def setup(profile: str):
+    """Register the skill-evaluator MCP server in ~/.claude.json.
+
+    Automatically detects Python path, run_server.py location, and
+    Databricks credentials from the given profile. After running this,
+    restart Claude Code and verify with /mcp.
+    """
+    import json
+    import subprocess
+    import configparser
+
+    claude_json_path = Path.home() / ".claude.json"
+
+    # 1. Find Python and run_server.py
+    python_path = sys.executable
+    run_server_path = str(Path(__file__).resolve().parent.parent.parent / "run_server.py")
+    if not Path(run_server_path).exists():
+        # Fallback: look relative to the installed package
+        import skill_evaluator
+        pkg_root = Path(skill_evaluator.__file__).resolve().parent.parent.parent
+        run_server_path = str(pkg_root / "run_server.py")
+    if not Path(run_server_path).exists():
+        click.echo("Error: Could not find run_server.py. Provide the path to the repo root.", err=True)
+        sys.exit(1)
+
+    # 2. Get Databricks host from profile
+    cfg_path = Path.home() / ".databrickscfg"
+    if not cfg_path.exists():
+        click.echo("Error: No ~/.databrickscfg found. Run: databricks auth login --host <URL>", err=True)
+        sys.exit(1)
+
+    cfg = configparser.ConfigParser()
+    cfg.read(cfg_path)
+    if profile not in cfg:
+        available = [s for s in cfg.sections() if s != "DEFAULT"]
+        click.echo(f"Error: Profile '{profile}' not found. Available: {', '.join(available)}", err=True)
+        sys.exit(1)
+
+    host = cfg[profile].get("host", "").rstrip("/")
+    if not host:
+        click.echo(f"Error: No host in profile '{profile}'", err=True)
+        sys.exit(1)
+
+    # 3. Get a fresh token
+    try:
+        result = subprocess.run(
+            ["databricks", "auth", "token", "--profile", profile],
+            capture_output=True, text=True, timeout=30,
+        )
+        token_data = json.loads(result.stdout)
+        token = token_data["access_token"]
+    except Exception as e:
+        click.echo(f"Error getting token: {e}", err=True)
+        click.echo("You may need to run: databricks auth login --host <URL>", err=True)
+        sys.exit(1)
+
+    # 4. Read or create ~/.claude.json
+    if claude_json_path.exists():
+        with open(claude_json_path) as f:
+            claude_data = json.load(f)
+    else:
+        claude_data = {}
+
+    if "mcpServers" not in claude_data:
+        claude_data["mcpServers"] = {}
+
+    # 5. Add/update skill-evaluator entry
+    claude_data["mcpServers"]["skill-evaluator"] = {
+        "command": python_path,
+        "args": [run_server_path],
+        "env": {
+            "DATABRICKS_CONFIG_PROFILE": profile,
+            "DATABRICKS_HOST": host,
+            "DATABRICKS_TOKEN": token,
+        },
+    }
+
+    with open(claude_json_path, "w") as f:
+        json.dump(claude_data, f, indent=2)
+
+    # 6. Auto-approve skill-evaluator MCP tools in Claude Code settings
+    settings_dir = Path.home() / ".claude"
+    settings_dir.mkdir(exist_ok=True)
+    settings_path = settings_dir / "settings.json"
+
+    if settings_path.exists():
+        with open(settings_path) as f:
+            settings_data = json.load(f)
+    else:
+        settings_data = {}
+
+    if "permissions" not in settings_data:
+        settings_data["permissions"] = {}
+    if "allow" not in settings_data["permissions"]:
+        settings_data["permissions"]["allow"] = []
+
+    tool_pattern = "mcp__skill-evaluator__*"
+    if tool_pattern not in settings_data["permissions"]["allow"]:
+        settings_data["permissions"]["allow"].append(tool_pattern)
+
+    with open(settings_path, "w") as f:
+        json.dump(settings_data, f, indent=2)
+
+    click.echo(f"Registered skill-evaluator MCP server in {claude_json_path}")
+    click.echo(f"Auto-approved skill-evaluator tools in {settings_path}")
+    click.echo(f"  Python:  {python_path}")
+    click.echo(f"  Server:  {run_server_path}")
+    click.echo(f"  Profile: {profile}")
+    click.echo(f"  Host:    {host}")
+    click.echo(f"  Token:   {token[:20]}... (expires ~1hr for OAuth)")
+    click.echo()
+    click.echo("Next steps:")
+    click.echo("  1. Restart Claude Code")
+    click.echo("  2. Run /mcp to verify skill-evaluator shows as connected")
+    click.echo("  3. Say: evaluate my skill at /path/to/my-skill")
+    click.echo("  All skill-evaluator tools will run without manual approval.")
+    click.echo()
+    click.echo("To refresh an expired token, re-run: dse setup --profile " + profile)
+
+
+@main.command()
 @click.argument("skill_dir", type=click.Path(exists=True))
 def init(skill_dir: str):
     """Initialize eval/ config for a skill directory."""
@@ -154,6 +276,9 @@ def evaluate(
         mcp_config = MCPConfig.from_mcp_json(Path(mcp_json))
     else:
         mcp_config = MCPConfig.auto_discover(Path(skill_dir))
+
+    if mcp_config:
+        mcp_config.resolve_available_tools()
 
     # Load test instructions
     test_instructions = SkillTestInstructions.from_skill_dir(Path(skill_dir))

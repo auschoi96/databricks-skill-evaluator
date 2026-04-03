@@ -49,7 +49,7 @@ These levels spin up a real Claude agent with the SKILL.md injected as system pr
 
 | Level | Test Source | Who Writes It | What Gets Tested |
 |-------|-----------|---------------|-----------------|
-| L1 | Built-in + optional `eval/tests/` | Evaluator + optionally you | Code blocks in SKILL.md parse correctly |
+| L1 | Built-in + optional `eval/tests/` | Evaluator + optionally you | Code block syntax, MCP tool availability, markdown links |
 | L2 | `eval/ground_truth.yaml` test cases | You | Agent completes tasks and uses correct tools |
 | L3 | Built-in 10-dimension rubric | Evaluator | SKILL.md document quality |
 | L4 | `ground_truth.yaml` + `thinking_instructions.md` | You | Agent's reasoning efficiency and clarity |
@@ -66,6 +66,7 @@ These levels spin up a real Claude agent with the SKILL.md injected as system pr
 
 **The evaluator generates** (built-in, no configuration needed):
 - L1 syntax validation of all code blocks
+- L1 MCP tool availability checking (AST-parsed from MCP server source)
 - L1 markdown link checking
 - L3 security scanning (regex for hardcoded tokens)
 - L3 tool accuracy checking (cross-reference against MCP server)
@@ -110,8 +111,8 @@ The FastMCP server exposes each level as a separate tool. Claude acts as the orc
 ```
 Claude: "Evaluate this skill"
   → discover_skill(skill_dir)           # Parse SKILL.md
-  → run_unit_tests(skill_dir)           # L1
-  → run_static_eval(skill_dir)          # L3
+  → run_unit_tests(skill_dir, mcp_json_path?)   # L1
+  → run_static_eval(skill_dir, mcp_json_path?)  # L3
   → [interpret results, show user]
   → run_output_eval(skill_dir, ...)     # L5 (if user wants)
   → generate_report(skill_dir, results) # HTML report
@@ -164,11 +165,19 @@ Each check produces a feedback entry like:
 {"name": "unit/python_syntax/SKILL.md:block_3", "value": "pass", "rationale": "Valid Python syntax"}
 ```
 
-**Step 3: Check for broken relative links.**
+**Step 3: Check that referenced MCP tools actually exist.**
+
+The evaluator extracts all MCP tool references from the skill content — both explicit `mcp__databricks__tool_name` patterns and bare tool names that match known MCP tools. It then cross-references them against the actual tools available in the MCP server.
+
+The tool list is populated by statically parsing the MCP server's Python source code via AST (following `.mcp.json` → entry point → `server.py` → tool modules → `@mcp.tool` decorated functions). This is purely file reads + `ast.parse()` — no subprocess, no MCP connections.
+
+If MCP config isn't available (no `.mcp.json` found), the check is gracefully skipped.
+
+**Step 4: Check for broken relative links.**
 
 The evaluator scans all markdown files for link patterns `[text](target)` using regex. For each relative link (skipping `http://`, `https://`, `#`, and `mailto:` URLs), it checks whether the target file actually exists on disk relative to the skill directory. This catches dead references like `[See the API reference](api.md)` when `api.md` doesn't exist.
 
-**Step 4: Run user-provided pytest tests (optional).**
+**Step 5: Run user-provided pytest tests (optional).**
 
 If the skill has an `eval/tests/` directory, the evaluator runs `pytest` against it via `subprocess.run()` with a 120-second timeout. This is the only part of L1 where **you** write the tests. The evaluator captures stdout/stderr and reports pass/fail:
 
@@ -189,11 +198,13 @@ All checks (syntax validations + link checks + pytest results) are weighted equa
 ```json
 {
   "level": "unit",
-  "score": 1.0,
+  "score": 0.95,
   "feedbacks": [
     {"name": "unit/python_syntax/SKILL.md:block_3", "value": "pass", "rationale": "Valid Python syntax", "source": "CODE"},
     {"name": "unit/sql_syntax/SKILL.md:block_7", "value": "pass", "rationale": "Valid SQL syntax", "source": "CODE"},
     {"name": "unit/yaml_syntax/config.md:block_1", "value": "pass", "rationale": "Valid YAML syntax", "source": "CODE"},
+    {"name": "unit/tool_available/create_or_update_genie", "value": "pass", "rationale": "Tool 'create_or_update_genie' found in MCP server", "source": "CODE"},
+    {"name": "unit/tool_available/ask_genie", "value": "pass", "rationale": "Tool 'ask_genie' found in MCP server", "source": "CODE"},
     {"name": "unit/link/SKILL.md/See spaces.md", "value": "pass", "rationale": "Link to 'spaces.md' exists", "source": "CODE"},
     {"name": "unit/pytest/suite", "value": "pass", "rationale": "8 passed in 1.2s", "source": "CODE"}
   ],
@@ -203,7 +214,7 @@ All checks (syntax validations + link checks + pytest results) are weighted equa
 
 ### Why this matters
 
-If a skill teaches Claude to write Python like `from databricks.sdk import WorkspaceClient(`, that syntax error gets baked into Claude's context window and can cause it to generate broken code. L1 catches this before any expensive agent runs happen.
+If a skill teaches Claude to write Python like `from databricks.sdk import WorkspaceClient(`, that syntax error gets baked into Claude's context window and can cause it to generate broken code. Similarly, if a skill references `create_or_update_genie` but that tool doesn't exist in the MCP server, every agent-based level (L2, L4, L5) will waste minutes running an agent that can't succeed. L1 catches both problems in milliseconds before any expensive agent runs happen.
 
 ---
 
@@ -265,6 +276,8 @@ The evaluator inspects the agent's execution trace (the record of every tool cal
 
 - **`banned_tools`**: Did the agent avoid forbidden tools? Typically `Bash` is banned when an MCP tool exists for the job. If the skill should teach the agent to use `create_or_update_genie` instead of shelling out to `databricks genie create`, this catches regressions.
 
+- **`tool_limits`**: Did the agent stay within the call count limits? If `ground_truth.yaml` specifies `tool_limits: {Bash: 3}`, the evaluator verifies `Bash` was called at most 3 times. This catches skills that allow excessive tool usage (e.g., too many shell commands when MCP tools should be preferred).
+
 - **Tool success rate**: What percentage of tool calls returned success? Computed as `(total - failed) / total`. Must be >= 80%. If the agent is calling tools that consistently error, the skill may have incorrect instructions.
 
 ### Scoring
@@ -307,7 +320,7 @@ L1 and L3 can tell you the skill document is well-written. L2 tells you it actua
 
 ## Level 3: Static Eval
 
-**File**: `levels/static_eval.py` (373 lines)
+**File**: `levels/static_eval.py`
 **No agent. 1 LLM call for semantic dimensions. Deterministic checks are free.**
 
 L3 is a quality audit of the SKILL.md document. Like L1, it does not run an agent. Unlike L1 (which only checks syntax), L3 evaluates the document's content and structure — is it self-contained? Are the instructions actionable? Could it cause hallucinations?
@@ -327,15 +340,24 @@ L3 is a quality audit of the SKILL.md document. Like L1, it does not run an agen
 | 9 | Error Handling Guidance | LLM | 1-10 |
 | 10 | No Hallucination Triggers | LLM | 1-10 |
 
+### Deduplication with L1
+
+Criteria 7 (tool accuracy) and 8 (examples valid) overlap with L1's syntax and tool checks. To avoid running the same validation twice:
+
+- **Orchestrator/CLI mode**: L3 receives L1's results via `LevelConfig.prior_results` and derives scores from L1's feedbacks. No checks are re-run.
+- **Standalone MCP mode**: When `run_static_eval` is called without L1 having run first, L3 runs its own checks using `shared_validators` utilities and L1's `_check_tool_references` function.
+
+Both modes produce equivalent scores. The shared validation functions (`extract_code_blocks`, `check_python_syntax`, `check_sql_syntax`, `check_yaml_syntax`) live in `levels/shared_validators.py` and are imported by both L1 and L3.
+
 ### How it works — two-phase evaluation
 
 **Phase 1 — Deterministic (zero LLM cost):**
 
 Three checks run before any LLM is invoked:
 
-- **Tool accuracy** (`_check_tool_accuracy`): Extracts every MCP tool name referenced in SKILL.md and cross-references it against `MCPConfig.available_tools` (the actual tools the MCP server exposes). If the skill mentions `create_or_update_genie` but the MCP server doesn't have it, it fails. The check handles both bare names (`create_or_update_genie`) and prefixed names (`mcp__databricks__create_or_update_genie`). Score: `(found_tools / referenced_tools) * 10`.
+- **Tool accuracy**: Cross-references MCP tool names in SKILL.md against `MCPConfig.available_tools`. Handles both bare names (`create_or_update_genie`) and prefixed names (`mcp__databricks__create_or_update_genie`). Score: `(found_tools / referenced_tools) * 10`. When L1 has already run, the score is derived from L1's `unit/tool_available/` feedbacks.
 
-- **Examples valid** (`_check_examples_valid`): Extracts code blocks and runs the same syntax validation as L1 (`ast.parse` for Python, `yaml.safe_load` for YAML, etc.). This is intentionally redundant with L1 — the score feeds into the static eval's overall average.
+- **Examples valid**: Validates Python, SQL, and YAML code blocks via `shared_validators`. When L1 has already run, the score is derived from L1's `unit/python_syntax/`, `unit/sql_syntax/`, and `unit/yaml_syntax/` feedbacks.
 
 - **Security scan** (`_check_security_deterministic`): Regex patterns scan the entire skill content for:
   - `dapi[a-f0-9]{32,}` — Databricks API tokens
@@ -354,14 +376,19 @@ A single LLM call evaluates the remaining 8 semantic dimensions. The prompt incl
 
 The judge returns a JSON array scoring each dimension 1-10 with specific evidence (quotes from the skill) and actionable recommendations for any score below 7.
 
+**LLM unavailability**: If the LLM backend is not installed or the judge call fails, L3 returns explicit `"skip"` feedback entries for each LLM dimension and sets `metadata.llm_skipped = true`. The coverage-factor scoring (below) ensures the overall score reflects that most of the evaluation was skipped.
+
 ### Scoring
 
 ```
-overall_score = mean(all 10 dimension scores)    # 1-10 scale
-normalized_score = overall_score / 10.0           # 0-1 for LevelResult.score
+overall_score = mean(all evaluated dimension scores)  # 1-10 scale
+coverage_factor = dimensions_evaluated / 10           # penalizes missing dims
+normalized_score = (overall_score / 10.0) * coverage_factor  # 0-1 for LevelResult.score
 ```
 
 A dimension **passes** at score >= 6, **fails** below 6.
+
+When only deterministic dimensions run (LLM unavailable), coverage_factor = 2/10 = 0.2, capping the max score at 0.2 to prevent inflation.
 
 ### Output format
 
@@ -386,7 +413,10 @@ A dimension **passes** at score >= 6, **fails** below 6.
     "recommendations": [
       "Line 45 references 'dbutils.fs.cp' but doesn't explain the parameters",
       "Missing error handling for pipeline creation failures"
-    ]
+    ],
+    "dimensions_evaluated": 10,
+    "dimensions_total": 10,
+    "coverage_factor": 1.0
   }
 }
 ```
@@ -399,35 +429,82 @@ A skill can have perfect syntax (L1 passes) but be structurally terrible — vag
 
 ## Level 4: Thinking Eval
 
-**File**: `levels/thinking_eval.py` (294 lines)
+**File**: `levels/thinking_eval.py`
 **Requires agent + workspace + MCP tools.**
 
-L4 evaluates **how the agent reasons**, not what it outputs. It runs the same real agent as L2, but instead of just checking "did it succeed?", it analyzes the execution transcript for reasoning quality.
+L4 evaluates **how the agent reasons**, not what it outputs. It runs the same real agent as L2, but instead of just checking "did it succeed?", it builds a comprehensive transcript of the agent's execution and has an LLM judge assess reasoning quality.
+
+### How L4 differs from L2 and L5
+
+| Aspect | L2 (Integration) | L4 (Thinking) | L5 (Output) |
+|--------|------------------|---------------|-------------|
+| **Question answered** | Did the agent succeed? | How well did it reason? | Is the skill helping? |
+| **Agent runs** | 1 (WITH skill) | 1 (WITH skill) | 2 (WITH + WITHOUT) |
+| **Trace checks** | required/banned tools, success rate | required/banned tools, token budget | asset verification, SoT comparison |
+| **LLM judge** | None | Reasoning quality (4 dimensions) | Response quality (WITH vs WITHOUT) |
+| **Scoring signal** | Binary pass/fail per test | Continuous 1-5 per dimension | Assertion classification (POSITIVE/REGRESSION) |
+
+L4's unique value: it's the only level that feeds the full execution transcript to an LLM judge for reasoning quality assessment. L2 checks "did it work?" and L5 checks "what did it produce?" — L4 checks "how did it think?"
 
 ### What it does — step by step
 
 **Step 1: Run agent with skill.**
 
-Same as L2 — `run_agent_sync_wrapper(prompt, skill_md, mcp_config)` produces an `AgentResult` with the full event stream.
+Same as L2 — `run_agent_sync_wrapper(prompt, skill_md, mcp_config)` produces an `AgentResult` with the full event stream. MLflow autolog (`mlflow.anthropic.autolog()`) automatically captures the complete session as an MLflow trace for observability.
 
 **Step 2: Deterministic trace scoring.**
 
-Four checks against the execution trace:
+Shared checks (via `shared_validators.check_trace_expectations()`, same code as L2):
 
-- **`required_tools`**: Same as L2 — did the agent call the expected MCP tools?
-- **`banned_tools`**: Same as L2 — did it avoid forbidden tools?
-- **`tool_limits`**: New in L4 — checks that specific tools weren't called more than N times. Example: `{Bash: 3}` means the agent can use Bash at most 3 times. Catches inefficient agents that shell out repeatedly.
-- **`token_budget`**: New in L4 — checks total token usage didn't exceed a budget. Example: `{max_total: 100000}`. Catches agents that burn through context window with verbose reasoning.
+- **`required_tools`**: Did the agent call the expected MCP tools?
+- **`banned_tools`**: Did it avoid forbidden tools?
+- **`tool_limits`**: Were specific tools called within count limits?
 
-**Step 3: LLM judge for reasoning quality (1 call per test case).**
+L4-only check:
 
-The LLM judge receives:
-- The test prompt
-- The full execution transcript (up to 50 events, each truncated to 500 chars)
-- Trace summary (tool counts, token counts, turn count, errors)
-- Custom `thinking_instructions.md` you wrote for this skill
+- **`token_budget`**: Total token usage didn't exceed a budget. Example: `{max_total: 100000}`. Catches agents that burn through context window with verbose reasoning.
 
-The judge scores 4 dimensions on a 1-5 scale:
+**Step 3: Build comprehensive transcript.**
+
+The `_build_comprehensive_transcript()` function processes the full event stream from `AgentResult.events` into a structured, human-readable format:
+
+```
+========================================
+TURN 1  (tokens: input=1200 output=340)
+========================================
+
+[THINKING] The user wants to create a Genie Space for Sales Analytics.
+I'll use create_or_update_genie with the specified table.
+
+[TOOL_USE] mcp__databricks__create_or_update_genie
+  Input: {"name": "Sales Analytics", "tables": ["ac_demo.dc_assistant.customers"]}
+
+[TOOL_RESULT] SUCCESS (mcp__databricks__create_or_update_genie)
+  {"space_id": "01f12ea7...", "name": "Sales Analytics", "tables_count": 1}
+
+========================================
+TURN 2  (tokens: input=2400 output=180)
+========================================
+
+[THINKING] The space was created. Let me verify it.
+
+[TOOL_USE] mcp__databricks__get_genie_space
+  Input: {"space_id": "01f12ea7..."}
+
+[TOOL_RESULT] SUCCESS (mcp__databricks__get_genie_space)
+  {"space_id": "01f12ea7...", ...}
+```
+
+Key design decisions:
+- **Agent reasoning text (`[THINKING]`)** is included — these are the most important signal for clarity and completeness scoring. Earlier versions dropped text blocks entirely.
+- **Tool_use → tool_result pairs** are structured together — the judge can see what was called and what happened.
+- **Errors are marked with `[ERROR]`** — critical for recovery scoring.
+- **Per-turn token usage** — directly supports efficiency assessment.
+- **Budget**: Up to 15,000 characters. If exceeded, the transcript preserves the beginning (initial approach) and end (completion), trimming the middle.
+
+**Step 4: LLM judge for reasoning quality (1 call per test case).**
+
+The LLM judge receives the comprehensive transcript, trace summary, and custom `thinking_instructions.md`. It scores 4 dimensions on a 1-5 scale:
 
 | Dimension | What it measures |
 |-----------|-----------------|
@@ -453,13 +530,19 @@ You write `eval/thinking_instructions.md` to define what "good reasoning" means 
 
 The LLM judge uses these to calibrate its scoring — what counts as "efficient" for a Genie skill (1-3 calls) is different from what's efficient for a complex pipeline skill (10-15 calls).
 
+### MLflow tracing
+
+Every L4 agent run is automatically traced via `mlflow.anthropic.autolog()`. The trace captures the complete conversation — prompts, tool calls, results, token usage, timing — and is stored in MLflow. Users can inspect the exact agent trajectory that L4 scored in the MLflow UI and drill into individual tool calls.
+
+The trace ID is stored on `AgentResult.mlflow_trace_id` and included in `task_results` for cross-referencing.
+
 ### Scoring
 
 ```
-score = passing_dimensions / total_dimensions
+score = mean(all_dimension_scores) / 5
 ```
 
-Where a dimension passes at score >= 3 (out of 5).
+The overall score uses the actual 1-5 dimension scores, normalized to 0-1. This preserves granularity — a test scoring 5/5/5/5 (score=1.0) is meaningfully different from 3/3/3/3 (score=0.6).
 
 ---
 
@@ -470,14 +553,15 @@ Where a dimension passes at score >= 3 (out of 5).
 
 L5 is the most comprehensive level. It evaluates across three dimensions — not just what the agent said, but what it actually built — using a controlled experiment design:
 
-### 5-phase evaluation pipeline
+### 6-phase evaluation pipeline
 
 ```
-Phase 1: Run agent WITH skill
-Phase 2: Run agent WITHOUT skill (cached baseline)
-Phase 3: Response text grading ─── WITH vs WITHOUT semantic comparison
-Phase 4: Asset verification ────── Did it actually create the resources?
-Phase 5: Source of truth comparison ─ Do created assets match expectations?
+Phase 1:  Run agent WITH skill
+Phase 2:  Run agent WITHOUT skill (cached baseline)
+Phase 3:  Response text grading ─── WITH vs WITHOUT semantic comparison
+Phase 4a: Asset verification (trace) ─ Tool calls succeeded? IDs returned? Params correct?
+Phase 4b: Live asset verification ──── Do resources actually exist in Databricks? (SDK)
+Phase 5:  Source of truth comparison ── Do created assets match expectations?
 ```
 
 ### Phase 1: Run agent WITH skill
@@ -539,6 +623,40 @@ asset_verification:
     - "The create_or_update_genie tool returned a space_id in its result"
     - "The tool was called with at least one sample question about customer demographics"
 ```
+
+### Phase 4b: Live asset verification (Databricks SDK)
+
+Trace-based checks (Phase 4) verify what the agent *said* it did. Phase 4b verifies what *actually exists* in the Databricks workspace by making live SDK calls.
+
+This is configured via `expectations.asset_verification.verify_live` in `ground_truth.yaml`:
+
+```yaml
+asset_verification:
+  verify_live:
+    - resource_type: genie_space
+      extract_id_from: mcp__databricks__create_or_update_genie
+      id_field: space_id
+      checks:
+        - field: display_name
+          operator: contains
+          value: "Sales Analytics"
+        - field: table_identifiers
+          operator: length_gte
+          value: 1
+```
+
+The evaluator:
+1. **Extracts the resource ID** from the agent's tool call results (e.g., `space_id` from the `create_or_update_genie` result)
+2. **Calls the Databricks SDK** to fetch the live resource (e.g., `client.genie.get_space(space_id)`)
+3. **Checks properties** against the spec using operators: `eq`, `contains`, `exists`, `length_gte`, `gte`, `lte`
+
+Supported resource types:
+- `genie_space` → `client.genie.get_space()`
+- `dashboard` → `client.lakeview.get()`
+- `job` → `client.jobs.get()`
+- `pipeline` → `client.pipelines.get()`
+
+If the Databricks SDK is not installed, live verification is gracefully skipped with `"skip"` feedback entries. Live verification feedbacks are included in the asset pass rate for scoring.
 
 ### Phase 5: Source of truth comparison
 
@@ -655,17 +773,20 @@ score = successful_tests / total_tests     # 0-1 (binary per test case)
 ### L3 Static Eval
 
 ```
-overall_score = mean(all 10 dimension scores)    # 1-10 scale
-normalized_score = overall_score / 10.0           # 0-1 for LevelResult.score
+overall_score = mean(all evaluated dimension scores)  # 1-10 scale
+coverage_factor = dimensions_evaluated / 10           # penalizes missing dims
+normalized_score = (overall_score / 10.0) * coverage_factor  # 0-1
 dimension_passes_at >= 6
 ```
 
 ### L4 Thinking Eval
 
 ```
-score = passing_dimensions / total_dimensions    # 0-1
+score = mean(all_dimension_scores) / 5    # 0-1, preserves continuous granularity
 dimension_passes_at >= 3 (out of 5)
 ```
+
+Each dimension is scored 1-5 by the LLM judge. The overall score averages all dimension scores across all test cases and normalizes to 0-1. This preserves granularity — 5/5/5/5 (score=1.0) is meaningfully different from 3/3/3/3 (score=0.6).
 
 ### L5 Output Eval — per-task score
 
