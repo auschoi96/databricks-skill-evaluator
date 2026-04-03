@@ -13,3 +13,18 @@ venv/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# IDE
+.idea/
+
+# Claude Code
+.claude/
+
+# Generated artifacts
+.databricks-resources.json
+
+# External / vendored repos (local only)
+skillforge-main/
+databricks-genie/
+databricks-mcp-server/
+databricks-tools-core/
