@@ -122,7 +122,7 @@ class AgentEvaluator:
         mcp_config: dict[str, Any] | None = None,
         allowed_tools: list[str] | None = None,
         agent_model: str | None = None,
-        agent_timeout: int = 300,
+        agent_timeout: int = 0,
         mlflow_experiment: str | None = None,
         skill_name: str | None = None,
         tool_modules: list[str] | None = None,
@@ -371,7 +371,7 @@ def create_agent_evaluator(
     mcp_config: dict[str, Any] | None = None,
     allowed_tools: list[str] | None = None,
     agent_model: str | None = None,
-    agent_timeout: int = 300,
+    agent_timeout: int = 0,
     mlflow_experiment: str | None = None,
     tool_modules: list[str] | None = None,
 ) -> Callable:

@@ -27,7 +27,7 @@ def _build_level_config(
     skill_dir: str,
     mcp_json_path: Optional[str] = None,
     agent_model: Optional[str] = None,
-    agent_timeout: int = 300,
+    agent_timeout: int = 0,
     judge_model: Optional[str] = None,
 ):
     """Construct a LevelConfig from a skill directory and saved workspace config."""
@@ -252,7 +252,7 @@ async def run_integration_tests(
     skill_dir: str,
     mcp_json_path: Optional[str] = None,
     agent_model: Optional[str] = None,
-    agent_timeout: int = 300,
+    agent_timeout: int = 0,
 ) -> str:
     """Run Level 2 integration tests — end-to-end against real Databricks.
 
@@ -284,7 +284,7 @@ async def run_thinking_eval(
     skill_dir: str,
     mcp_json_path: Optional[str] = None,
     agent_model: Optional[str] = None,
-    agent_timeout: int = 300,
+    agent_timeout: int = 0,
 ) -> str:
     """Run Level 4 thinking evaluation — assess agent reasoning quality.
 
@@ -318,7 +318,7 @@ async def run_output_eval(
     skill_dir: str,
     mcp_json_path: Optional[str] = None,
     agent_model: Optional[str] = None,
-    agent_timeout: int = 300,
+    agent_timeout: int = 0,
 ) -> str:
     """Run Level 5 output evaluation — WITH vs WITHOUT skill comparison.
 

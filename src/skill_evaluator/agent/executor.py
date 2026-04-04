@@ -566,7 +566,7 @@ async def run_agent(
     mcp_config: dict[str, Any] | None = None,
     allowed_tools: list[str] | None = None,
     cwd: str | None = None,
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 0,
     model: str | None = None,
     mlflow_experiment: str | None = None,
     skill_name: str | None = None,
@@ -583,7 +583,7 @@ async def run_agent(
             Keys are server names, values are McpServerConfig objects.
         allowed_tools: List of allowed tool names. Defaults to common builtins.
         cwd: Working directory for the agent. Defaults to current dir.
-        timeout_seconds: Maximum execution time. Default 300s (5 min).
+        timeout_seconds: Maximum execution time in seconds. 0 = no timeout.
         model: Override the model to use (via env var).
         tool_modules: Optional list of MCP tool modules to expose (e.g.
             ``["genie", "sql"]``).  When set, only tools from those modules
