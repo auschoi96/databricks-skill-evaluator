@@ -399,10 +399,18 @@ def _build_html_report(config: EvaluationSuiteConfig, result: EvaluationSuiteRes
     # ── Score bar chart ──
     score_bars_html = ""
     for level_name in _LEVEL_ORDER:
+        lvl_num = _LEVEL_ORDER.index(level_name) + 1
         if level_name not in result.level_results:
+            score_bars_html += f"""
+        <div class="score-bar-row" style="opacity:0.4">
+            <span class="score-bar-label">L{lvl_num} {_esc(level_name)}</span>
+            <div class="score-bar-track">
+                <div class="score-bar-fill" style="width:0%"></div>
+            </div>
+            <span class="score-bar-value" style="color:var(--text-muted)">—</span>
+        </div>"""
             continue
         lr = result.level_results[level_name]
-        lvl_num = _LEVEL_ORDER.index(level_name) + 1
         pct = lr.score * 100
         color = score_color(lr.score)
         score_bars_html += f"""
@@ -417,10 +425,24 @@ def _build_html_report(config: EvaluationSuiteConfig, result: EvaluationSuiteRes
     # ── Level detail cards ──
     level_cards = ""
     for level_name in _LEVEL_ORDER:
+        lvl_num = _LEVEL_ORDER.index(level_name) + 1
         if level_name not in result.level_results:
+            level_cards += f"""
+        <div class="section" style="opacity:0.5">
+            <div class="section-title">Level {lvl_num}: {_esc(level_name.upper())}</div>
+            <div class="card">
+                <div class="card-header">
+                    <svg class="icon"><use href="#icon-x"/></svg>
+                    <span class="card-title">{_esc(level_name.title())}</span>
+                    <span class="badge" style="background:var(--bg-l3);color:var(--text-muted)">NOT RUN</span>
+                </div>
+                <div class="card-body">
+                    <p style="font-size:12px;color:var(--text-muted)">This level was not included in the evaluation run.</p>
+                </div>
+            </div>
+        </div>"""
             continue
         lr = result.level_results[level_name]
-        lvl_num = _LEVEL_ORDER.index(level_name) + 1
         color = score_color(lr.score)
         meta = lr.metadata or {}
 
