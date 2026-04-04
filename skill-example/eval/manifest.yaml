@@ -1,0 +1,32 @@
+# manifest.yaml - Scorer configuration for your skill evaluation
+#
+# This file configures which scorers run and their thresholds.
+# Adjust these based on what your skill produces (Python, SQL, YAML, etc.)
+
+skill_name: my-skill
+tool_modules: []                    # List of Python modules providing custom tools (if any)
+description: "Evaluation config for my-skill"
+
+scorers:
+  enabled:
+    - python_syntax                 # Validates Python code blocks are syntactically correct
+    - sql_syntax                    # Validates SQL code blocks are syntactically correct
+    - pattern_adherence             # Checks regex patterns from ground_truth.yaml
+    - expected_facts_present        # Checks expected_facts from ground_truth.yaml
+  default_guidelines:
+    - "Response must address user's request completely"
+    - "Code must follow documented best practices"
+  trace_expectations:
+    tool_limits:
+      Bash: 10                      # Max Bash calls across all test cases
+      Read: 20                      # Max Read calls across all test cases
+    token_budget:
+      max_total: 100000             # Total token budget for agent execution
+    required_tools: []              # Tools that MUST appear in every trace
+    banned_tools: []                # Tools that must NEVER appear in any trace
+
+# Quality gates - minimum scores to pass each check
+# 1.0 = 100% must pass, 0.9 = 90% must pass, etc.
+quality_gates:
+  syntax_valid: 1.0                 # All code blocks must be valid syntax
+  pattern_adherence: 0.9            # 90% of pattern checks must pass

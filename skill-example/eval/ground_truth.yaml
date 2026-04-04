@@ -1,0 +1,152 @@
+# ground_truth.yaml - Test cases for evaluating your skill
+#
+# This is the most important file you'll write. Each test case defines:
+#   1. A prompt (what the user asks)
+#   2. Expectations (what a correct response looks like)
+#   3. Metadata (for categorization and splitting)
+#
+# Tips:
+#   - Start with 3-5 happy-path cases covering core workflows
+#   - Add 2-3 edge cases or error recovery scenarios
+#   - Aim for 8+ total cases to enable train/val splitting during optimization
+#   - Be specific in assertions — "calls my_tool_create with both params"
+#     is far better than "response is correct"
+
+metadata:
+  skill_name: my-skill
+  version: 0.1.0
+  created_at: "2026-04-04"
+
+test_cases:
+
+  # ──────────────────────────────────────────────────────────────
+  # HAPPY PATH: Core workflows your skill teaches
+  # ──────────────────────────────────────────────────────────────
+
+  - id: create_basic_resource
+    inputs:
+      prompt: "Create a resource called 'Demo' using my_catalog.my_schema.my_table"
+    expectations:
+
+      # expected_facts — checked via deterministic substring matching (zero LLM cost).
+      # Use these for values that MUST appear verbatim in the response.
+      expected_facts:
+        - "my_catalog.my_schema.my_table"
+        - "Demo"
+
+      # expected_patterns — checked via regex matching (zero LLM cost).
+      # Use these to verify the agent called the right tools or produced the right structure.
+      expected_patterns:
+        - pattern: "my_tool_create"
+          min_count: 1
+          description: "Must call the my_tool_create tool"
+
+      # assertions — evaluated by an LLM judge against the execution transcript.
+      # Use these for semantic checks that can't be done with substring/regex.
+      assertions:
+        - "The response actually invokes my_tool_create (not just describes how to)"
+        - "The table identifier is passed correctly to the tool"
+
+      # guidelines — quality guidelines evaluated semantically by LLM judge.
+      # Use these for "should" behaviors rather than hard pass/fail.
+      guidelines:
+        - "The agent should use MCP tools, not write Python code to call REST APIs"
+        - "The agent should confirm success after creating the resource"
+
+      # trace_expectations — checked against the actual tool-call execution trace.
+      # Use these to enforce which tools were/weren't used and how many times.
+      trace_expectations:
+        required_tools:
+          - mcp__my_server__my_tool_create
+        banned_tools: []
+        tool_limits:
+          Bash: 3                   # Should not need more than 3 Bash calls
+
+    metadata:
+      category: happy_path          # Used for stratified train/val splitting
+      difficulty: easy              # easy | medium | hard
+
+  - id: query_resource
+    inputs:
+      prompt: "Get the details of resource 'abc123'"
+    expectations:
+      expected_facts:
+        - "abc123"
+      expected_patterns:
+        - pattern: "my_tool_get"
+          min_count: 1
+          description: "Must call my_tool_get to retrieve the resource"
+      assertions:
+        - "The response invokes my_tool_get with the correct resource_id"
+        - "The response presents the resource details in a readable format"
+      trace_expectations:
+        required_tools:
+          - mcp__my_server__my_tool_get
+    metadata:
+      category: happy_path
+      difficulty: easy
+
+  - id: inspect_then_create
+    inputs:
+      prompt: "I have a table at my_catalog.my_schema.my_table. First check its schema, then create a resource based on what columns are available."
+    expectations:
+      expected_facts:
+        - "my_catalog.my_schema.my_table"
+      expected_patterns:
+        - pattern: "my_tool_get"
+          min_count: 1
+          description: "Should inspect the table first"
+        - pattern: "my_tool_create"
+          min_count: 1
+          description: "Then create the resource"
+      assertions:
+        - "The agent inspects the table schema before creating the resource"
+        - "The resource configuration is informed by the actual columns discovered"
+      guidelines:
+        - "The agent should follow a logical order: inspect first, then create"
+      trace_expectations:
+        required_tools:
+          - mcp__my_server__my_tool_get
+          - mcp__my_server__my_tool_create
+    metadata:
+      category: happy_path
+      difficulty: medium
+
+  # ──────────────────────────────────────────────────────────────
+  # EDGE CASES: Unusual inputs or multi-step workflows
+  # ──────────────────────────────────────────────────────────────
+
+  - id: list_all_resources
+    inputs:
+      prompt: "List all resources in my workspace"
+    expectations:
+      expected_patterns:
+        - pattern: "my_tool_get"
+          min_count: 1
+          description: "Must call my_tool_get without an ID to list all"
+      assertions:
+        - "The response calls my_tool_get to list all available resources"
+      trace_expectations:
+        required_tools:
+          - mcp__my_server__my_tool_get
+    metadata:
+      category: happy_path
+      difficulty: easy
+
+  # ──────────────────────────────────────────────────────────────
+  # ERROR RECOVERY: How the agent handles failures
+  # ──────────────────────────────────────────────────────────────
+
+  - id: error_recovery_bad_table
+    inputs:
+      prompt: "Create a resource using the table my_catalog.nonexistent_schema.fake_table"
+    expectations:
+      # No expected_facts or patterns needed — we're testing behavior, not output.
+      assertions:
+        - "The agent handles the error when the table doesn't exist"
+        - "The agent does NOT silently succeed with a broken configuration"
+      guidelines:
+        - "The agent should either check if the table exists first or handle the error gracefully"
+    metadata:
+      category: error_recovery
+      difficulty: hard
