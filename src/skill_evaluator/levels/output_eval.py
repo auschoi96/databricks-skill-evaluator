@@ -206,7 +206,7 @@ class OutputEvalLevel(EvalLevel):
             with_transcript = None
             if hasattr(with_result, "events") and with_result.events:
                 with_transcript = [
-                    {"type": e.type, "data": str(e.data)[:500]}
+                    {"type": e.type, "data": _truncate_event_data(e.data)}
                     for e in with_result.events[:50]
                 ]
 
@@ -552,7 +552,7 @@ Return JSON array:
         # Check the last call (in case of retries)
         tc = matching_calls[-1]
         result_data = _parse_tool_result(tc.result)
-        if result_data is None:
+        if not isinstance(result_data, dict):
             return None
 
         return str(result_data[id_field]) if id_field in result_data else None
@@ -818,17 +818,20 @@ def _is_error_result(result: str) -> bool:
 
 
 def _parse_tool_result(result: str | None) -> dict | None:
-    """Try to parse a tool result string as JSON."""
+    """Try to parse a tool result string as a JSON dict."""
     if not result:
         return None
     try:
-        return json.loads(result)
+        parsed = json.loads(result)
+        return parsed if isinstance(parsed, dict) else None
     except (json.JSONDecodeError, TypeError):
         return None
 
 
-def _extract_resource_id(data: dict) -> str | None:
+def _extract_resource_id(data) -> str | None:
     """Extract a resource ID from a tool result dict."""
+    if not isinstance(data, dict):
+        return None
     for key in ["space_id", "dashboard_id", "job_id", "pipeline_id", "run_id",
                  "id", "resource_id", "assistant_id", "index_name"]:
         if key in data and data[key]:
@@ -841,3 +844,16 @@ def _truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - 3] + "..."
+
+
+def _truncate_event_data(data: dict, max_str_len: int = 500) -> dict:
+    """Truncate string values in event data dict while preserving structure."""
+    result = {}
+    for k, v in data.items():
+        if isinstance(v, str) and len(v) > max_str_len:
+            result[k] = v[:max_str_len] + "..."
+        elif isinstance(v, dict):
+            result[k] = _truncate_event_data(v, max_str_len)
+        else:
+            result[k] = v
+    return result
