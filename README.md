@@ -83,7 +83,7 @@ my-skill/
     source_of_truth/          # YOU add: expected output files for comparison
 ```
 
-`dse init` creates these files with placeholder TODOs. You fill them in based on your domain expertise. See [example.md](example.md) for a complete walkthrough of writing eval criteria for a real skill.
+`dse init` creates these files with placeholder TODOs. You fill them in based on your domain expertise. See the [skill-example/](skill-example/) directory for a ready-to-copy template with annotated files showing how to structure your skill folder, write ground truth, and configure evaluation. For a full end-to-end walkthrough using a real skill, see [example.md](example.md).
 
 ## Evaluation Levels
 
@@ -282,6 +282,10 @@ databricks-skill-evaluator/
         sql-correctness/       # SQL best practices rubric
         tool-selection/        # MCP tool preference rubric
 ```
+
+## Setting Up a Skill for Evaluation
+
+Start with the [skill-example/](skill-example/) directory — it contains a ready-to-copy template with annotated versions of every required file. The [skill-example/README.md](skill-example/README.md) explains the folder structure, what goes inside vs. outside the skill directory, and how to write your first test cases.
 
 ## Full Walkthrough
 
