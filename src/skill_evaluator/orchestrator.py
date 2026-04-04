@@ -104,6 +104,14 @@ def run_evaluation_suite(config: EvaluationSuiteConfig) -> EvaluationSuiteResult
     # Order by dependency
     ordered = [l for l in _LEVEL_ORDER if l in requested]
 
+    # Carry forward results from prior runs for levels not being re-run
+    prior = _load_prior_results(config)
+    if prior:
+        for level_name, level_result in prior.level_results.items():
+            if level_name not in ordered:
+                result.level_results[level_name] = level_result
+                logger.info(f"  Carried forward prior result for {level_name} (score: {level_result.score:.2f})")
+
     # Build shared LevelConfig
     level_config = LevelConfig(
         workspace=config.workspace,
@@ -182,6 +190,9 @@ def run_evaluation_suite(config: EvaluationSuiteConfig) -> EvaluationSuiteResult
 
     # Generate HTML report
     _generate_report(config, result)
+
+    # Save results so subsequent partial runs can merge them
+    _save_results(config, result)
 
     logger.info(f"\n{'='*60}")
     logger.info(f"EVALUATION COMPLETE")
@@ -347,6 +358,42 @@ def _generate_suggestions(result: EvaluationSuiteResult) -> list[str]:
                 )
 
     return suggestions
+
+
+def _load_prior_results(config: EvaluationSuiteConfig) -> Optional[EvaluationSuiteResult]:
+    """Load results from a previous evaluation run for merging."""
+    try:
+        results_path = config.skill.path / "eval" / "evaluation_results.json"
+        if not results_path.exists():
+            return None
+
+        data = json.loads(results_path.read_text())
+        if data.get("skill_name") != config.skill.name:
+            return None
+
+        level_results = {}
+        for name, level_data in data.get("levels", {}).items():
+            level_results[name] = LevelResult.from_dict(level_data)
+
+        return EvaluationSuiteResult(
+            skill_name=data["skill_name"],
+            level_results=level_results,
+            composite_score=data.get("composite_score", 0.0),
+        )
+    except Exception as e:
+        logger.debug(f"Could not load prior results: {e}")
+        return None
+
+
+def _save_results(config: EvaluationSuiteConfig, result: EvaluationSuiteResult) -> None:
+    """Save evaluation results to disk for merging with subsequent runs."""
+    try:
+        results_path = config.skill.path / "eval" / "evaluation_results.json"
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        results_path.write_text(json.dumps(result.to_dict(), indent=2, default=str))
+        logger.info(f"Evaluation results saved to {results_path}")
+    except Exception as e:
+        logger.debug(f"Could not save results: {e}")
 
 
 def _generate_report(config: EvaluationSuiteConfig, result: EvaluationSuiteResult) -> None:

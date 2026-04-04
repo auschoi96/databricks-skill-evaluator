@@ -214,7 +214,7 @@ class OutputEvalLevel(EvalLevel):
                 with_response=with_result.response_text,
                 without_response=without_result.response_text,
                 expectations=grading_expectations,
-                judge_model=config.judge_model or "databricks/databricks-claude-sonnet-4-6",
+                judge_model=config.judge_model or "databricks/databricks-claude-opus-4-6",
                 with_transcript=with_transcript,
             )
 
@@ -427,7 +427,7 @@ Return JSON array:
 
         try:
             response = completion_with_fallback(
-                model=config.judge_model or "databricks/databricks-claude-sonnet-4-6",
+                model=config.judge_model or "databricks/databricks-claude-opus-4-6",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
             )
@@ -738,7 +738,7 @@ Return JSON:
 
         try:
             response = completion_with_fallback(
-                model=config.judge_model or "databricks/databricks-claude-sonnet-4-6",
+                model=config.judge_model or "databricks/databricks-claude-opus-4-6",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
             )

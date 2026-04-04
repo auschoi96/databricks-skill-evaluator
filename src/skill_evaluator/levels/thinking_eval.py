@@ -347,7 +347,7 @@ class ThinkingEvalLevel(EvalLevel):
             errors=", ".join(errors) if errors else "none",
         )
 
-        model = judge_model or "databricks/databricks-claude-sonnet-4-6"
+        model = judge_model or "databricks/databricks-claude-opus-4-6"
 
         try:
             response = completion_with_fallback(

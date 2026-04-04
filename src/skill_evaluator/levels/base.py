@@ -43,7 +43,20 @@ class LevelResult:
             "task_results": self.task_results,
             "artifacts": self.artifacts,
             "metadata": self.metadata,
+            "trace_ids": self.trace_ids,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LevelResult":
+        return cls(
+            level=data.get("level", ""),
+            score=data.get("score", 0.0),
+            feedbacks=data.get("feedbacks", []),
+            task_results=data.get("task_results"),
+            artifacts=data.get("artifacts"),
+            metadata=data.get("metadata"),
+            trace_ids=data.get("trace_ids", []),
+        )
 
 
 @dataclass

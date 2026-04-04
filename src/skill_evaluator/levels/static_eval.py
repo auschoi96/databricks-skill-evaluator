@@ -461,7 +461,7 @@ class StaticEvalLevel(EvalLevel):
             precheck_results=precheck_text,
         )
 
-        judge_model = config.judge_model or "databricks/databricks-claude-sonnet-4-6"
+        judge_model = config.judge_model or "databricks/databricks-claude-opus-4-6"
 
         try:
             response = completion_with_fallback(

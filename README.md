@@ -18,22 +18,13 @@ This framework answers those questions with a 5-level testing pyramid:
 
 L1 and L3 run in seconds with zero agent cost. L2/L4/L5 run real Claude Code agents and compare behavior with and without the skill.
 
-## Two Modes
-
-| Mode | Interface | Best For |
-|------|-----------|----------|
-| **CLI** | `dse evaluate ./my-skill` | CI/CD, batch evaluation, scripting |
-| **MCP Tools + Skill** | Claude calls `run_static_eval`, etc. | Interactive Claude Code sessions |
-
-Both modes use the same underlying evaluation levels and produce the same results.
-
 ## Install
 
 ```bash
 pip install databricks-skill-evaluator
 ```
 
-## Quick Start — CLI Mode
+## Quick Start
 
 ```bash
 # 1. Authenticate with your Databricks workspace
@@ -56,97 +47,6 @@ dse evaluate ./my-skill --levels all --mcp-json .mcp.json  # Full (minutes)
 # 6. Optimize based on results
 dse optimize ./my-skill --feedback eval/feedback.json --preset quick
 ```
-
-## Quick Start — MCP Mode (Claude Code Skill)
-
-### Step 1: Install and register
-
-```bash
-# Install the package
-pip install databricks-skill-evaluator
-
-# Register the MCP server in ~/.claude.json (auto-detects paths and credentials)
-dse setup --profile my-workspace
-```
-
-`dse setup` automatically:
-- Finds your Python interpreter and `run_server.py`
-- Reads your Databricks host from `~/.databrickscfg`
-- Gets a fresh auth token via `databricks auth token`
-- Writes the full MCP config (command, args, env) to `~/.claude.json`
-- Adds `mcp__skill-evaluator__*` to `~/.claude/settings.json` so all evaluation tools run without manual approval — no clicking "Allow" at each step
-
-> **Note**: OAuth tokens expire (~1 hour). Re-run `dse setup --profile my-workspace` to refresh. For long-lived access, use a [Personal Access Token](https://docs.databricks.com/en/dev-tools/auth/pat.html) and set it manually in `~/.claude.json` under `mcpServers.skill-evaluator.env.DATABRICKS_TOKEN`.
-
-### Step 2: Verify
-
-Restart Claude Code (exit and relaunch), then run:
-
-```
-/mcp
-```
-
-You should see `skill-evaluator · ✔ connected`.
-
-### Step 3: Run an evaluation
-
-Reference the SKILL.md to teach Claude the evaluation workflow, then ask it to evaluate:
-
-```
-@/path/to/databricks-skill-evaluator/SKILL.md evaluate my skill at /path/to/my-skill
-```
-
-Claude orchestrates the full evaluation:
-- Phase 0: Authenticate → Phase 1: Discover skill
-- Phase 2: L1 Unit Tests + L3 Static Eval (seconds, free/cheap)
-- Phase 3: L2 Integration + L4 Thinking + L5 Output (minutes, agent-based)
-- Phase 4: Generate HTML report with scores and recommendations
-
-### Step 4 (for agent-based levels): Databricks MCP server
-
-L2, L4, and L5 run real Claude agents that need Databricks MCP tools. Add a Databricks MCP server to `~/.claude.json` alongside the skill-evaluator if you don't already have one.
-
-<details>
-<summary>Manual setup (if dse setup doesn't work)</summary>
-
-Open `~/.claude.json` and add `skill-evaluator` inside the existing `"mcpServers"` object:
-
-```json
-"skill-evaluator": {
-  "command": "/path/to/python",
-  "args": ["/path/to/databricks-skill-evaluator/run_server.py"],
-  "env": {
-    "DATABRICKS_CONFIG_PROFILE": "my-workspace",
-    "DATABRICKS_HOST": "https://my-workspace.cloud.databricks.com",
-    "DATABRICKS_TOKEN": "dapi..."
-  }
-}
-```
-
-Find your values:
-```bash
-python -c "import sys; print(sys.executable)"   # Python path
-databricks auth token --profile my-workspace     # Fresh token
-```
-
-</details>
-
-### Available MCP Tools
-
-| Tool | Purpose |
-|------|---------|
-| `authenticate_workspace` | Connect to Databricks |
-| `discover_skill` | Parse a skill directory |
-| `init_eval_config` | Scaffold eval/ templates |
-| `run_unit_tests` | L1: Code syntax validation |
-| `run_static_eval` | L3: SKILL.md quality (10 criteria, 1-10 scale) |
-| `run_integration_tests` | L2: Real agent against Databricks |
-| `run_thinking_eval` | L4: Agent reasoning quality |
-| `run_output_eval` | L5: WITH/WITHOUT comparison |
-| `generate_report` | HTML report from results |
-| `run_optimization` | GEPA optimization (future) |
-
----
 
 ## What You Provide
 
@@ -283,7 +183,6 @@ The optimizer reads human feedback, runs mutations, evaluates each candidate wit
 ## CLI Reference
 
 ```
-dse setup      Register MCP server in ~/.claude.json (auto-detects paths + credentials)
 dse auth       Authenticate with Databricks and save config
 dse init       Initialize eval/ config for a skill directory
 dse evaluate   Run evaluation (--levels unit,static,integration,thinking,output,all)
@@ -304,40 +203,34 @@ Key flags for `dse evaluate`:
 
 ## Architecture
 
-Two entry points — same evaluation levels underneath.
-
 ```
-  CLI Mode                              MCP Mode (Claude Code)
-  ────────                              ──────────────────────
-  dse auth|init|evaluate|optimize       Claude + SKILL.md
-          │                                     │
-          ▼                                     ▼
-    Orchestrator                          FastMCP Server
-    (runs all levels                      (10 tools, Claude
-     sequentially)                         calls individually)
-          │                                     │
-          └──────────────┬──────────────────────┘
-                         │
-          ┌──────────────▼──────────────────────┐
-          │         5 Evaluation Levels          │
-          │                                      │
-          │  L1 Unit ─── syntax, links, YAML     │
-          │  L2 Integration ── agent + workspace  │
-          │  L3 Static ── LLM judge (1-10 scale) │
-          │  L4 Thinking ── agent trace quality   │
-          │  L5 Output ── WITH/WITHOUT compare    │
-          └──────────────┬──────────────────────┘
-                         │
-          ┌──────────────▼──────────────────────┐
-          │       Shared Infrastructure          │
-          │                                      │
-          │  Semantic Grader (3-phase hybrid)     │
-          │  Claude Agent SDK (executor.py)       │
-          │  Deterministic Scorers (syntax, trace)│
-          │  LLM Backend (model fallback chain)   │
-          │  MLflow Tracing + Assessment APIs     │
-          │  HTML Report Generator                │
-          └─────────────────────────────────────┘
+  dse auth | init | evaluate | optimize
+          │
+          ▼
+    Orchestrator
+    (runs levels sequentially)
+          │
+          ▼
+  ┌─────────────────────────────────┐
+  │       5 Evaluation Levels       │
+  │                                 │
+  │  L1 Unit ─── syntax, links     │
+  │  L2 Integration ── agent + ws  │
+  │  L3 Static ── LLM judge        │
+  │  L4 Thinking ── trace quality  │
+  │  L5 Output ── WITH/WITHOUT     │
+  └──────────────┬──────────────────┘
+                 │
+  ┌──────────────▼──────────────────┐
+  │     Shared Infrastructure       │
+  │                                 │
+  │  Semantic Grader (3-phase)      │
+  │  Claude Agent SDK (executor.py) │
+  │  Deterministic Scorers          │
+  │  LLM Backend (model fallback)   │
+  │  MLflow Tracing + Assessments   │
+  │  HTML Report Generator          │
+  └─────────────────────────────────┘
 ```
 
 ## Project Structure
@@ -345,16 +238,13 @@ Two entry points — same evaluation levels underneath.
 ```
 databricks-skill-evaluator/
   SKILL.md                     # Claude Code skill (teaches evaluation workflow)
-  .mcp.json                    # MCP server config
-  run_server.py                # MCP server entry point
-  pyproject.toml               # pip install, dse + dse-server entry points
+  pyproject.toml               # pip install, dse entry point
   README.md                    # This file
   TECHNICAL.md                 # Deep dive into internals
   example.md                   # End-to-end walkthrough with databricks-genie
   src/skill_evaluator/
-    server.py                  # FastMCP server — 10 MCP tools
     cli.py                     # Click CLI — dse command
-    orchestrator.py            # Suite runner (CLI mode)
+    orchestrator.py            # Suite runner
     auth.py                    # Databricks auth + ~/.dse/config.yaml
     skill_discovery.py         # Parse SKILL.md frontmatter + references
     mcp_resolver.py            # Resolve .mcp.json for agent execution

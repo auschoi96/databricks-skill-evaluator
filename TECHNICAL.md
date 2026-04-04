@@ -1,6 +1,6 @@
 # Technical Deep Dive: Skill Evaluator Internals
 
-This document explains how each evaluation level works, the semantic grading pipeline, scoring formulas, MCP server architecture, and MLflow integration.
+This document explains how each evaluation level works, the semantic grading pipeline, scoring formulas, and MLflow integration.
 
 For setup and usage, see [README.md](README.md). For a hands-on walkthrough, see [example.md](example.md).
 
@@ -9,7 +9,7 @@ For setup and usage, see [README.md](README.md). For a hands-on walkthrough, see
 ## Table of Contents
 
 - [What Are These Tests?](#what-are-these-tests)
-- [Two Interfaces, One Engine](#two-interfaces-one-engine)
+- [How CLI Evaluation Works](#how-cli-evaluation-works)
 - [Level 1: Unit Tests](#level-1-unit-tests)
 - [Level 2: Integration Tests](#level-2-integration-tests)
 - [Level 3: Static Eval](#level-3-static-eval)
@@ -17,7 +17,7 @@ For setup and usage, see [README.md](README.md). For a hands-on walkthrough, see
 - [Level 5: Output Eval](#level-5-output-eval)
 - [Semantic Grading Pipeline](#semantic-grading-pipeline)
 - [Scoring Formulas](#scoring-formulas)
-- [MCP Server Architecture](#mcp-server-architecture)
+- [Agent MCP Configuration](#agent-mcp-configuration-l2-l4-l5)
 - [MLflow Integration](#mlflow-integration)
 - [GEPA Optimization](#gepa-optimization)
 - [Data Formats](#data-formats)
@@ -84,11 +84,9 @@ These levels spin up a real Claude agent with the SKILL.md injected as system pr
 
 ---
 
-## Two Interfaces, One Engine
+## How CLI Evaluation Works
 
-The framework has two entry points that share all underlying code:
-
-### CLI Mode (`cli.py` → `orchestrator.py`)
+`cli.py` → `orchestrator.py`
 
 The `dse evaluate` command creates an `EvaluationSuiteConfig`, passes it to `run_evaluation_suite()`, which runs levels sequentially, logs to MLflow, and generates the HTML report — all in one call.
 
@@ -104,27 +102,7 @@ dse evaluate ./my-skill --levels all
     → _log_suite_to_mlflow()
 ```
 
-### MCP Mode (`server.py` → individual tools)
-
-The FastMCP server exposes each level as a separate tool. Claude acts as the orchestrator — calling tools one at a time, interpreting results between calls, and deciding what to run next.
-
-```
-Claude: "Evaluate this skill"
-  → discover_skill(skill_dir)           # Parse SKILL.md
-  → run_unit_tests(skill_dir, mcp_json_path?)   # L1
-  → run_static_eval(skill_dir, mcp_json_path?)  # L3
-  → [interpret results, show user]
-  → run_output_eval(skill_dir, ...)     # L5 (if user wants)
-  → generate_report(skill_dir, results) # HTML report
-```
-
-Both paths call the same `EvalLevel.run(config)` methods and produce the same `LevelResult` objects.
-
-### State Between MCP Tool Calls
-
-MCP tools are stateless per-call. Each tool receives `skill_dir` and reconstructs `SkillDescriptor` and `SkillTestInstructions` from disk (fast filesystem reads). Workspace config is loaded from `~/.dse/config.yaml` (saved by `authenticate_workspace` or `dse auth`).
-
-The one piece of server-side state is the L5 **baseline cache** — WITHOUT-skill agent runs cached by prompt hash in `output_eval._baseline_cache`. Since the FastMCP server is a long-lived process, this cache persists across tool calls within the same session.
+Each level's `.run(config)` method returns a `LevelResult` with score, feedbacks, and metadata. Workspace config is loaded from `~/.dse/config.yaml` (saved by `dse auth`).
 
 ---
 
@@ -342,12 +320,9 @@ L3 is a quality audit of the SKILL.md document. Like L1, it does not run an agen
 
 ### Deduplication with L1
 
-Criteria 7 (tool accuracy) and 8 (examples valid) overlap with L1's syntax and tool checks. To avoid running the same validation twice:
+Criteria 7 (tool accuracy) and 8 (examples valid) overlap with L1's syntax and tool checks. To avoid running the same validation twice, L3 receives L1's results via `LevelConfig.prior_results` and derives scores from L1's feedbacks. No checks are re-run.
 
-- **Orchestrator/CLI mode**: L3 receives L1's results via `LevelConfig.prior_results` and derives scores from L1's feedbacks. No checks are re-run.
-- **Standalone MCP mode**: When `run_static_eval` is called without L1 having run first, L3 runs its own checks using `shared_validators` utilities and L1's `_check_tool_references` function.
-
-Both modes produce equivalent scores. The shared validation functions (`extract_code_blocks`, `check_python_syntax`, `check_sql_syntax`, `check_yaml_syntax`) live in `levels/shared_validators.py` and are imported by both L1 and L3.
+The shared validation functions (`extract_code_blocks`, `check_python_syntax`, `check_sql_syntax`, `check_yaml_syntax`) live in `levels/shared_validators.py` and are imported by both L1 and L3.
 
 ### How it works — two-phase evaluation
 
@@ -572,7 +547,7 @@ Same as L2/L4 — `run_agent_sync_wrapper(prompt, skill_md, mcp_config)`. The ag
 
 The same prompt is run **without** the skill: `run_agent_sync_wrapper(prompt, skill_md=None, mcp_config)`. The agent has access to the same MCP tools but doesn't get the SKILL.md instructions.
 
-This baseline is cached by prompt hash (`sha256(prompt)[:12]`). Since the model and prompt don't change, the baseline is stable across runs. In MCP mode, the cache persists across tool calls within the same server session.
+This baseline is cached by prompt hash (`sha256(prompt)[:12]`). Since the model and prompt don't change, the baseline is stable across runs.
 
 ### Phase 3: Response text grading (WITH vs WITHOUT)
 
@@ -827,74 +802,29 @@ composite_score = mean(all level scores)          # 0-1
 
 ---
 
-## MCP Server Architecture
+## Agent MCP Configuration (L2, L4, L5)
 
-**File**: `server.py` (445 lines)
-
-### FastMCP setup
-
-```python
-from fastmcp import FastMCP
-mcp = FastMCP("Skill Evaluator")
-```
-
-10 tools registered via `@mcp.tool()` decorators. Each tool:
-1. Parses parameters (skill_dir, optional overrides)
-2. Calls `_build_level_config()` to construct `LevelConfig` from disk
-3. Runs the level's `.run(config)` method
-4. Returns JSON via `json.dumps(result.to_dict())`
-
-### Async handling
-
-Agent-based tools (L2, L4, L5) can block for minutes. They use `asyncio.to_thread()`:
-
-```python
-@mcp.tool()
-async def run_thinking_eval(skill_dir, ...) -> str:
-    config = _build_level_config(skill_dir, ...)
-    result = await asyncio.to_thread(ThinkingEvalLevel().run, config)
-    return json.dumps(result.to_dict())
-```
-
-### Error handling
-
-Every tool wraps its body in try/except and returns structured error JSON:
-
-```json
-{"error": "No workspace config found. Call authenticate_workspace first.", "error_type": "ValueError"}
-```
-
-This lets Claude diagnose failures and suggest fixes (e.g., "You need to authenticate first").
-
-### Nested MCP (agent-based levels)
-
-L2/L4/L5 run a real Claude Code agent that itself needs MCP tools (the Databricks MCP server). The flow:
+L2/L4/L5 run a real Claude Code agent that needs MCP tools (e.g., a Databricks MCP server). The flow:
 
 ```
-skill-evaluator MCP server
-  → run_thinking_eval tool
+dse evaluate ./my-skill --levels all --mcp-json .mcp.json
+  → orchestrator runs L2/L4/L5
     → run_agent_sync_wrapper(mcp_config=databricks_servers)
       → Claude Agent SDK subprocess
         → starts Databricks MCP server independently
         → agent uses Databricks tools (execute_sql, create_genie, etc.)
 ```
 
-The `mcp_json_path` parameter tells the evaluator where to find the Databricks MCP server config. It auto-discovers `.mcp.json` from parent directories if not specified.
+The `--mcp-json` flag tells the evaluator where to find the Databricks MCP server config. It auto-discovers `.mcp.json` from parent directories if not specified.
 
 ---
 
 ## MLflow Integration
 
-### CLI mode
-
 The orchestrator creates a single MLflow run with:
 - **Tags**: `skill_name`, `eval_type`, `levels`, `framework_version`
 - **Metrics**: Per-level scores (`L1/unit/score`, `L3/static/score`, etc.)
 - **Artifacts**: `evaluation.json`, `report.html`
-
-### MCP mode
-
-MLflow logging happens in `generate_report` when results are collected. Individual level tools don't log to MLflow — they return results to Claude, who passes them to `generate_report`.
 
 ### Experiment structure
 
@@ -919,7 +849,7 @@ Experiment: /Users/you@databricks.com/GenAI/skill-evals
 
 **Files**: `optimize/config.py`, `optimize/feedback.py`, `optimize/splitter.py`, `optimize/utils.py`
 
-[GEPA](https://github.com/gepa-ai/gepa) (Generalized Evolutionary Prompt Architect) treats the SKILL.md as a text artifact to optimize. The modules are extracted and ready — the `run_optimization` MCP tool and `dse optimize` CLI command are scaffolded.
+[GEPA](https://github.com/gepa-ai/gepa) (Generalized Evolutionary Prompt Architect) treats the SKILL.md as a text artifact to optimize. The modules are extracted and ready — the `dse optimize` CLI command is scaffolded.
 
 ### Presets
 

@@ -27,19 +27,20 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_JUDGE_LM = os.environ.get("GEPA_JUDGE_LM", "databricks/databricks-claude-sonnet-4-6")
+DEFAULT_JUDGE_LM = os.environ.get("GEPA_JUDGE_LM", "databricks/databricks-claude-opus-4-6")
 
 # ---------------------------------------------------------------------------
 # Fallback model chain for rate limit errors
 # ---------------------------------------------------------------------------
 
 _DEFAULT_FALLBACK_MODELS = [
+    "databricks/databricks-claude-opus-4-6",
+    "databricks/databricks-claude-sonnet-4-6",
+    "databricks/databricks-claude-opus-4-5",
+    "databricks/databricks-claude-sonnet-4-5",
     "databricks/databricks-gpt-5-2",
     "databricks/databricks-gemini-3-1-pro",
-    "databricks/databricks-claude-opus-4-5",
     "databricks/databricks-gpt-5",
-    "databricks/databricks-claude-sonnet-4-6",
-    "databricks/databricks-claude-sonnet-4-5",
 ]
 
 
@@ -195,12 +196,23 @@ def _get_gateway_base_url() -> str | None:
 # ---------------------------------------------------------------------------
 
 
+_cached_workspace_client = None
+_cached_workspace_profile = None
+
+
 def _get_credentials_from_sdk() -> tuple[str, str]:
     """Get host and token from Databricks SDK using saved DSE config or default profile.
 
     Returns:
         (host, token) — host is the workspace URL, token is a fresh OAuth/PAT token.
+
+    The WorkspaceClient is cached so that its internal token-refresh logic
+    stays alive across calls.  Each invocation calls ``config.authenticate()``
+    to obtain a *fresh* bearer token, avoiding 403 errors when OAuth tokens
+    expire during long-running evaluations (~90 min).
     """
+    global _cached_workspace_client, _cached_workspace_profile
+
     # Try loading profile from saved DSE config first
     profile = None
     try:
@@ -213,10 +225,21 @@ def _get_credentials_from_sdk() -> tuple[str, str]:
 
     try:
         from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+
+        # Reuse the WorkspaceClient so its internal OAuth state (refresh
+        # tokens, etc.) persists.  Recreate only if the profile changed.
+        if _cached_workspace_client is None or _cached_workspace_profile != profile:
+            _cached_workspace_client = (
+                WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+            )
+            _cached_workspace_profile = profile
+
+        w = _cached_workspace_client
         host = w.config.host.rstrip("/")
-        # config.token is None for OAuth (databricks-cli) auth — get it
-        # from the header factory which handles token refresh.
+
+        # Always call authenticate() to get a fresh token.  For PAT auth
+        # this is a no-op (returns the same token).  For OAuth/U2M auth
+        # this refreshes the token when it's near expiry.
         token = w.config.token
         if not token:
             headers = w.config.authenticate()
@@ -323,6 +346,7 @@ def completion_with_fallback(*, model: str, max_retries: int = 3, **kwargs) -> A
     for model_str in models_to_try:
         client, endpoint_name = _get_openai_client_and_model(model_str)
 
+        auth_retried = False
         for attempt in range(max_retries):
             if attempt > 0:
                 delay = min(2**attempt, 30)
@@ -334,8 +358,16 @@ def completion_with_fallback(*, model: str, max_retries: int = 3, **kwargs) -> A
                 )
             except Exception as e:
                 last_err = e
-                # Workspace-level errors: fail fast, no fallback
+                # Workspace-level errors (403/auth): retry once with a
+                # fresh token in case the OAuth token expired mid-eval.
                 if _is_workspace_error(e):
+                    if not auth_retried:
+                        auth_retried = True
+                        logger.warning(
+                            "Workspace auth error — refreshing credentials and retrying: %s", e,
+                        )
+                        client, endpoint_name = _get_openai_client_and_model(model_str)
+                        continue
                     logger.error(
                         "Workspace error (fail-fast): %s — not trying fallback models",
                         e,

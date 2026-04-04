@@ -54,7 +54,7 @@ Return a JSON array with one object per dimension:
 [{{"dimension": "self_contained", "score": 8, "evidence": "...", "recommendation": "..."}}]
 """,
             feedback_value_type=Literal["yes", "no"],
-            model=model or "databricks/databricks-claude-sonnet-4-6",
+            model=model or "databricks/databricks-claude-opus-4-6",
         )
     except (ImportError, Exception) as e:
         logger.debug(f"make_judge unavailable for static eval: {e}")
@@ -92,7 +92,7 @@ Return JSON array:
 [{{"dimension": "efficiency", "score": 4, "evidence": "..."}}]
 """,
             feedback_value_type=Literal["yes", "no"],
-            model=model or "databricks/databricks-claude-sonnet-4-6",
+            model=model or "databricks/databricks-claude-opus-4-6",
         )
     except (ImportError, Exception) as e:
         logger.debug(f"make_judge unavailable for thinking eval: {e}")
@@ -126,7 +126,7 @@ Return JSON array:
 [{{"index": 0, "passed": true, "evidence": "Tool call created space with 3 tables"}}]
 """,
             feedback_value_type=Literal["yes", "no"],
-            model=model or "databricks/databricks-claude-sonnet-4-6",
+            model=model or "databricks/databricks-claude-opus-4-6",
         )
     except (ImportError, Exception) as e:
         logger.debug(f"make_judge unavailable for asset verification: {e}")
@@ -159,7 +159,7 @@ Return JSON:
 ]
 """,
             feedback_value_type=Literal["yes", "no"],
-            model=model or "databricks/databricks-claude-sonnet-4-6",
+            model=model or "databricks/databricks-claude-opus-4-6",
         )
     except (ImportError, Exception) as e:
         logger.debug(f"make_judge unavailable for SoT comparison: {e}")

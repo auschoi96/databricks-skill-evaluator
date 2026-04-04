@@ -232,7 +232,7 @@ def run_static_eval(
     Args:
         skill_dir: Absolute path to the skill directory
         mcp_json_path: Path to .mcp.json for tool accuracy verification (auto-discovers if omitted)
-        judge_model: LLM model for semantic evaluation (default: databricks-claude-sonnet-4-6)
+        judge_model: LLM model for semantic evaluation (default: databricks-claude-opus-4-6)
     """
     try:
         config = _build_level_config(skill_dir, mcp_json_path=mcp_json_path, judge_model=judge_model)
@@ -377,13 +377,8 @@ def generate_report(
         level_data = json.loads(level_results_json)
         level_results = {}
         for name, data in level_data.items():
-            level_results[name] = LevelResult(
-                level=data.get("level", name),
-                score=data.get("score", 0.0),
-                feedbacks=data.get("feedbacks", []),
-                task_results=data.get("task_results"),
-                metadata=data.get("metadata"),
-            )
+            data.setdefault("level", name)
+            level_results[name] = LevelResult.from_dict(data)
 
         suite_result = EvaluationSuiteResult(
             skill_name=skill.name,

@@ -158,7 +158,7 @@ def _semantic_grade(
         assertions_block=assertions_block,
     )
 
-    model = judge_model or "databricks/databricks-claude-sonnet-4-6"
+    model = judge_model or "databricks/databricks-claude-opus-4-6"
 
     try:
         resp = completion_with_fallback(
@@ -265,21 +265,27 @@ def _agent_grade(
     response: str,
     assertions: list[str],
     transcript: list[dict] | None = None,
-    agent_model: str | None = None,
+    judge_model: str | None = None,
     agent_timeout: int = 90,
 ) -> list[AssertionResult]:
-    """Grade assertions via direct Anthropic API call.
+    """Grade assertions using Databricks FMAPI with transcript context.
 
-    Uses the same auth as the Claude Code agent (ANTHROPIC_BASE_URL,
-    ANTHROPIC_AUTH_TOKEN) but makes a direct API call — grading is pure
-    reasoning, no tools needed.
+    Uses the transcript-aware prompt so the judge can see which MCP tools
+    the agent called, not just the final response text.  Routes through
+    ``completion_with_fallback`` (Databricks serving endpoints) for
+    consistent auth and automatic model fallback on rate limits.
 
-    Falls back to _semantic_grade() (litellm) if the call fails.
+    Args:
+        response: The agent's final response text.
+        assertions: List of assertion strings to evaluate.
+        transcript: Serialized agent events (tool_use, tool_result, text).
+        judge_model: Databricks model for grading (e.g. "databricks/databricks-claude-opus-4-6").
+        agent_timeout: Unused, kept for API compat.
     """
     if not assertions:
         return []
 
-    import os as _os
+    from ..grading.llm_backend import completion_with_fallback
 
     assertions_block = "\n".join(f"{i}. {a}" for i, a in enumerate(assertions))
     transcript_text = _format_transcript(transcript)
@@ -290,42 +296,26 @@ def _agent_grade(
         assertions_block=assertions_block,
     )
 
-    # Read auth from env (set by executor's _load_agent_env before we run)
-    base_url = _os.environ.get("ANTHROPIC_BASE_URL", "")
-    api_key = _os.environ.get("ANTHROPIC_AUTH_TOKEN", "") or _os.environ.get("ANTHROPIC_API_KEY", "")
-    model = agent_model or _os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-
-    # Custom headers (e.g., Databricks coding agent mode)
-    extra_headers: dict[str, str] = {}
-    custom_headers = _os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
-    if custom_headers:
-        for header in custom_headers.split(","):
-            header = header.strip()
-            if ":" in header:
-                k, v = header.split(":", 1)
-                extra_headers[k.strip()] = v.strip()
+    model = judge_model or "databricks/databricks-claude-opus-4-6"
 
     try:
-        import anthropic
-
-        client_kwargs: dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        if extra_headers:
-            client_kwargs["default_headers"] = extra_headers
-
-        client = anthropic.Anthropic(**client_kwargs)
-
-        resp = client.messages.create(
+        resp = completion_with_fallback(
             model=model,
-            max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
+            temperature=0,
         )
 
-        raw = resp.content[0].text.strip() if resp.content else ""
+        raw = resp.choices[0].message.content or ""
+        raw = raw.strip()
         if not raw:
-            logger.warning("Anthropic grader returned empty — falling back to litellm")
-            return _semantic_grade(response, assertions, judge_model=agent_model)
+            logger.warning("Agent grader returned empty response")
+            return [
+                AssertionResult(
+                    text=a, passed=False, evidence="Grader returned empty response",
+                    method="agent", assertion_type="assertion",
+                )
+                for a in assertions
+            ]
 
         # Strip markdown fences
         if raw.startswith("```"):
@@ -341,8 +331,14 @@ def _agent_grade(
         grades = parsed.get("assertions", parsed) if isinstance(parsed, dict) else parsed
 
     except Exception as e:
-        logger.warning("Anthropic grading failed: %s — falling back to litellm", e)
-        return _semantic_grade(response, assertions, judge_model=agent_model)
+        logger.warning("Agent grading failed: %s — marking all as failed", e)
+        return [
+            AssertionResult(
+                text=a, passed=False, evidence=f"Agent grading failed: {e}",
+                method="agent", assertion_type="assertion",
+            )
+            for a in assertions
+        ]
 
     # Map response back to assertions
     if isinstance(grades, list):
@@ -379,16 +375,14 @@ def grade_assertions(
     assertions: list[str] | None = None,
     judge_model: str | None = None,
     transcript: list[dict] | None = None,
-    agent_model: str | None = None,
-    agent_timeout: int = 90,
 ) -> list[AssertionResult]:
-    """Grade all assertions against a response using hybrid deterministic + agent approach.
+    """Grade all assertions against a response using hybrid deterministic + Databricks FMAPI approach.
 
     Strategy:
       1. Check expected_patterns deterministically (regex — zero cost)
       2. Check expected_facts deterministically (substring — zero cost)
       3. Collect: deterministic failures + freeform assertions + guidelines
-      4. Grade via Claude Code agent (with transcript), falling back to litellm
+      4. Grade via Databricks FMAPI (with transcript context for tool-call visibility)
 
     Args:
         response: The text to check assertions against.
@@ -396,10 +390,8 @@ def grade_assertions(
         expected_patterns: Regex patterns to check (legacy format).
         guidelines: Natural-language guidelines to convert to assertions.
         assertions: Freeform assertion strings for semantic grading.
-        judge_model: Model for litellm fallback grading.
-        transcript: Serialized AgentResult.events for agent grading.
-        agent_model: Model for the Claude Code grader agent.
-        agent_timeout: Timeout for the grader agent.
+        judge_model: Databricks model for grading (default: databricks-claude-opus-4-6).
+        transcript: Serialized AgentResult.events for transcript-aware grading.
 
     Returns:
         List of AssertionResult with per-assertion pass/fail and evidence.
@@ -431,13 +423,12 @@ def grade_assertions(
         for g in guidelines:
             semantic_items.append(f"The response follows this guideline: {g}")
 
-    # Step 4: Agent grading (Claude Code grader, falls back to litellm)
+    # Step 4: Agent grading (Databricks FMAPI with transcript context)
     if semantic_items:
         semantic_results = _agent_grade(
             response, semantic_items,
             transcript=transcript,
-            agent_model=agent_model,
-            agent_timeout=agent_timeout,
+            judge_model=judge_model,
         )
 
         # Upgrade deterministic fact failures that pass semantic grading
@@ -501,8 +492,6 @@ def grade_with_without(
     judge_model: str | None = None,
     with_transcript: list[dict] | None = None,
     without_transcript: list[dict] | None = None,
-    agent_model: str | None = None,
-    agent_timeout: int = 90,
 ) -> tuple[list[AssertionResult], list[AssertionResult], dict[str, Any]]:
     """Grade both WITH and WITHOUT responses and produce GEPA-compatible diagnostics.
 
@@ -510,7 +499,7 @@ def grade_with_without(
         with_response: Response generated with skill in context.
         without_response: Response generated without skill (baseline).
         expectations: Dict with expected_facts, expected_patterns, guidelines, assertions.
-        judge_model: Model for semantic grading.
+        judge_model: Databricks model for grading (default: databricks-claude-opus-4-6).
 
     Returns:
         (with_results, without_results, diagnostics) where diagnostics contains
@@ -521,7 +510,7 @@ def grade_with_without(
     guidelines = expectations.get("guidelines", [])
     freeform_assertions = expectations.get("assertions", [])
 
-    # Grade WITH-skill response (agent grading with transcript)
+    # Grade WITH-skill response (Databricks FMAPI grading with transcript)
     with_results = grade_assertions(
         with_response,
         expected_facts=expected_facts,
@@ -530,8 +519,6 @@ def grade_with_without(
         assertions=freeform_assertions,
         judge_model=judge_model,
         transcript=with_transcript,
-        agent_model=agent_model,
-        agent_timeout=agent_timeout,
     )
 
     # Grade WITHOUT-skill response
@@ -552,8 +539,7 @@ def grade_with_without(
         without_semantic = _agent_grade(
             without_response, without_semantic_items,
             transcript=without_transcript,
-            agent_model=agent_model,
-            agent_timeout=agent_timeout,
+            judge_model=judge_model,
         )
         freeform_count = len(freeform_assertions or [])
         for sr in without_semantic[:freeform_count]:
