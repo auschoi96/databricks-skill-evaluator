@@ -211,7 +211,7 @@ def init(skill_dir: str):
 @click.option("--schema", default=None, help="Schema override")
 @click.option("--experiment", default=None, help="MLflow experiment path override")
 @click.option("--agent-model", default=None, help="Claude model for agent execution")
-@click.option("--agent-timeout", default=300, type=int, help="Agent timeout in seconds")
+@click.option("--agent-timeout", default=0, type=int, help="Agent timeout in seconds (0 = no timeout)")
 @click.option("--judge-model", default=None, help="LLM model for judge evaluations")
 @click.option("--suggest-improvements", is_flag=True, help="Generate improvement suggestions")
 @click.option("--compare-baseline", default=None, help="MLflow run ID to compare against")

@@ -33,7 +33,7 @@ class EvaluationSuiteConfig:
     mcp_config: Optional[MCPConfig] = None
     levels: list[str] = field(default_factory=lambda: ["unit", "static", "thinking", "output"])
     agent_model: Optional[str] = None
-    agent_timeout: int = 300
+    agent_timeout: int = 0  # 0 = no timeout
     judge_model: Optional[str] = None
     parallel_agents: int = 2
     suggest_improvements: bool = False

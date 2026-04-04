@@ -68,7 +68,7 @@ class LevelConfig:
     test_instructions: "SkillTestInstructions"
     mcp_config: Optional["MCPConfig"] = None
     agent_model: Optional[str] = None
-    agent_timeout: int = 300
+    agent_timeout: int = 0  # 0 = no timeout
     judge_model: Optional[str] = None
     parallel_agents: int = 2
     prior_results: dict[str, "LevelResult"] = field(default_factory=dict)

@@ -743,7 +743,7 @@ async def run_agent(
                 now = datetime.now(timezone.utc)
                 elapsed = time.monotonic() - start_time
 
-                if elapsed > timeout_seconds:
+                if timeout_seconds and elapsed > timeout_seconds:
                     events.append(
                         AgentEvent(
                             type="error",
@@ -945,7 +945,7 @@ def _run_in_fresh_loop(coro) -> Any:
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         future = pool.submit(_thread_target)
-        future.result(timeout=600)  # wait for thread to finish
+        future.result(timeout=3600)  # wait for thread to finish (1h max)
     except concurrent.futures.TimeoutError:
         # Don't let shutdown(wait=True) block -- the thread is still running
         pool.shutdown(wait=False)
