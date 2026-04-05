@@ -29,8 +29,19 @@ class MCPConfig:
     def from_mcp_json(cls, path: Path) -> "MCPConfig":
         """Load MCP config from a .mcp.json file.
 
-        Resolves ${VAR} and ${VAR:-default} patterns in the config.
+        Resolves ${VAR} and ${VAR:-default} patterns in the config,
+        strips Claude Code-only keys (e.g. ``defer_loading``), and
+        falls back to ``sys.executable`` when the configured Python
+        interpreter does not exist on disk.
         """
+        import shutil
+        import sys
+
+        # Keys specific to Claude Code's interactive UI.  defer_loading
+        # prevents the MCP server from starting in spawned agent
+        # subprocesses, causing "No such tool available" errors.
+        _STRIP_KEYS = {"defer_loading"}
+
         path = Path(path).resolve()
         if not path.exists():
             raise MCPResolverError(f"MCP config not found: {path}")
@@ -42,7 +53,22 @@ class MCPConfig:
         resolved = {}
 
         for name, config in servers.items():
-            resolved[name] = _resolve_env_vars(config, path.parent)
+            resolved_config = _resolve_env_vars(config, path.parent)
+            for key in _STRIP_KEYS:
+                resolved_config.pop(key, None)
+
+            # Fall back to current Python if the configured interpreter
+            # is missing (e.g. .venv doesn't exist in this environment).
+            cmd = resolved_config.get("command", "")
+            if cmd and not Path(cmd).exists() and not shutil.which(cmd):
+                logger.warning(
+                    "MCP server '%s': configured python '%s' not found, "
+                    "falling back to '%s'",
+                    name, cmd, sys.executable,
+                )
+                resolved_config["command"] = sys.executable
+
+            resolved[name] = resolved_config
 
         return cls(servers=resolved)
 

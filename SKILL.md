@@ -19,6 +19,20 @@ pip install -e /path/to/databricks-skill-evaluator
 
 Verify with `dse --help`. For agent-based levels (L2/L4/L5), a Databricks workspace must be configured.
 
+### MCP Server Setup (required for agent-based levels)
+
+Agent-based levels (L2/L4/L5) spawn Claude agents that call MCP tools. If the skill under evaluation references MCP tools (e.g., `mcp__databricks__*`), those MCP servers must be **installed and importable** in the current Python environment.
+
+The `.mcp.json` may reference a `.venv/bin/python` that doesn't exist locally. The evaluator will automatically fall back to the current Python interpreter, but the MCP server packages must be installed. Run:
+
+```bash
+./setup.sh --with-mcp
+```
+
+This installs `databricks-tools-core` and `databricks-mcp-server` (must be cloned into the repo root first). Without this, agent-based levels will fail with "No such tool available" errors.
+
+**Not every skill requires MCP tools.** If the skill being evaluated doesn't reference MCP tools, skip this step and omit `--mcp-json` from `dse evaluate` commands.
+
 ---
 
 ## Dispatch
@@ -77,7 +91,12 @@ dse init <skill_dir>
 
 This discovers the skill and scaffolds eval templates if missing.
 
-**GATE — MCP config check**: If the user provided an `.mcp.json` path, verify it exists and pass it as `--mcp-json <path>` to all subsequent `dse evaluate` commands. Without this, agent-based levels (L2/L4/L5) will have no MCP tools and fail.
+**GATE — MCP config check**: If the user provided an `.mcp.json` path:
+1. Verify the file exists.
+2. Check that the MCP server packages are installed by running: `python -c "import databricks_mcp_server"` (or the relevant server package). If the import fails, tell the user to run `./setup.sh --with-mcp`.
+3. Pass `--mcp-json <path>` to all subsequent `dse evaluate` commands. Without this, agent-based levels (L2/L4/L5) will have no MCP tools and fail.
+
+If the skill does NOT reference MCP tools, skip this gate entirely — `--mcp-json` is not needed.
 
 **GATE — eval config check**: If `eval/ground_truth.yaml` doesn't exist or contains only TODOs, STOP and tell the user:
 
@@ -219,6 +238,7 @@ Write your `ground_truth.yaml` assertions BEFORE polishing the skill. The assert
 | "No SKILL.md found in ..." | Verify the directory contains SKILL.md |
 | "No test cases in ground_truth.yaml" | Run `dse init`, fill in TODOs |
 | "MCP tool not reachable" | Check `.mcp.json` path, verify MCP server starts |
+| "No such tool available: mcp__*" | MCP server failed to start. Check: (1) `./setup.sh --with-mcp` was run, (2) the MCP server package is importable in the current Python, (3) `.mcp.json` command path exists (the evaluator falls back to `sys.executable` if `.venv` is missing) |
 | "REQUEST_LIMIT_EXCEEDED" | Wait 30s and retry |
 | "Agent timeout" | Increase `--agent-timeout` or simplify the test case |
 
