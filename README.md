@@ -156,13 +156,21 @@ See [skill-example/](skill-example/) for a complete annotated template.
 
 ### Step 7: Run evaluation
 
-**Quick eval** (seconds, no agent needed):
+**Preferred: Let Claude Code run it.** Just ask Claude Code to evaluate your skill — it has access to the skill-evaluator MCP tools and will orchestrate the evaluation for you, choosing the right levels and options automatically. For example:
+
+> "Evaluate my-skill using @SKILL.md at all levels"
+
+Claude Code will call the appropriate `dse` commands, monitor progress, and surface results directly in the conversation.
+
+**CLI reference** (if you prefer to run manually):
+
+Quick eval (seconds, no agent needed):
 
 ```bash
 dse evaluate my-skill --levels unit,static
 ```
 
-**Full eval** (minutes, runs real Claude agents against Databricks):
+Full eval (minutes, runs real Claude agents against Databricks):
 
 ```bash
 dse evaluate my-skill --levels all
