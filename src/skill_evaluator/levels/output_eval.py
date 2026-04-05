@@ -241,7 +241,17 @@ class OutputEvalLevel(EvalLevel):
 
         except ImportError:
             # Fallback: simple assertion checking
-            feedbacks = self._simple_assertion_check(case_id, with_result.response_text, expectations)
+            # Build minimal transcript text for pattern matching
+            transcript_text = ""
+            if hasattr(with_result, "events") and with_result.events:
+                lines = []
+                for e in with_result.events[:50]:
+                    if e.type == "tool_use":
+                        lines.append(f"[TOOL_USE] {e.data.get('name', '')}")
+                transcript_text = "\n".join(lines)
+            feedbacks = self._simple_assertion_check(
+                case_id, with_result.response_text, expectations, transcript_text,
+            )
             passed = sum(1 for f in feedbacks if f["value"] == "pass")
             total = len(feedbacks)
             return feedbacks, passed / total if total > 0 else 0.0
@@ -772,6 +782,7 @@ Return JSON:
 
     def _simple_assertion_check(
         self, case_id: str, response: str, expectations: dict,
+        transcript_text: str = "",
     ) -> list[dict[str, Any]]:
         """Fallback assertion checking without the semantic grader."""
         feedbacks = []
@@ -786,10 +797,11 @@ Return JSON:
                 "source": "CODE",
             })
 
+        search_text = response + "\n" + transcript_text if transcript_text else response
         for pat_config in expectations.get("expected_patterns", []):
             pattern = pat_config if isinstance(pat_config, str) else pat_config.get("pattern", "")
             min_count = pat_config.get("min_count", 1) if isinstance(pat_config, dict) else 1
-            matches = len(re.findall(pattern, response, re.IGNORECASE))
+            matches = len(re.findall(pattern, search_text, re.IGNORECASE))
             passed = matches >= min_count
             feedbacks.append({
                 "name": f"output/{case_id}/pattern/{pattern[:40]}",

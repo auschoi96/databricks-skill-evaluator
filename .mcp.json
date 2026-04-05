@@ -2,7 +2,7 @@
   "mcpServers": {
     "databricks": {
       "command": "${CLAUDE_PLUGIN_ROOT}/.venv/bin/python",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/databricks-mcp-server/run_server.py"],
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcps/databricks-mcp-server/run_server.py"],
       "defer_loading": true
     },
     "skill-evaluator": {

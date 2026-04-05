@@ -182,16 +182,40 @@ def setup(profile: str):
     click.echo("To refresh an expired token, re-run: dse setup --profile " + profile)
 
 
+@main.command(name="list")
+def list_skills():
+    """List available skills in the skills/ directory."""
+    from .paths import SKILLS_DIR, list_available_skills
+
+    skills = list_available_skills()
+    if not skills:
+        click.echo(f"No skills found in {SKILLS_DIR}/")
+        click.echo(f"Copy a skill directory into {SKILLS_DIR}/ to get started.")
+        return
+
+    click.echo(f"Available skills ({SKILLS_DIR}/):\n")
+    for name in skills:
+        skill_path = SKILLS_DIR / name
+        has_eval = (skill_path / "eval" / "ground_truth.yaml").exists()
+        status = "ready" if has_eval else "needs init"
+        click.echo(f"  {name:30s} [{status}]")
+
+
 @main.command()
-@click.argument("skill_dir", type=click.Path(exists=True))
+@click.argument("skill_dir", type=click.Path())
 def init(skill_dir: str):
-    """Initialize eval/ config for a skill directory."""
+    """Initialize eval/ config for a skill directory.
+
+    SKILL_DIR can be a name (resolved from skills/) or a path.
+    """
+    from .paths import resolve_skill_dir
     from .skill_discovery import SkillDescriptor, SkillDiscoveryError
     from .test_instructions import init_eval_config
 
+    resolved = resolve_skill_dir(skill_dir)
     try:
-        skill = SkillDescriptor.from_directory(Path(skill_dir))
-        eval_dir = init_eval_config(Path(skill_dir), skill.name)
+        skill = SkillDescriptor.from_directory(resolved)
+        eval_dir = init_eval_config(resolved, skill.name)
         click.echo(f"Initialized eval config for '{skill.name}' in {eval_dir}")
         click.echo(f"Files created:")
         for f in sorted(eval_dir.rglob("*")):
@@ -203,9 +227,9 @@ def init(skill_dir: str):
 
 
 @main.command()
-@click.argument("skill_dir", type=click.Path(exists=True))
+@click.argument("skill_dir", type=click.Path())
 @click.option("--levels", default="unit,static", help="Comma-separated levels: unit,integration,static,thinking,output,all")
-@click.option("--mcp-json", type=click.Path(), default=None, help="Path to .mcp.json for MCP tools")
+@click.option("--mcp-json", type=click.Path(), default=None, help="Path to .mcp.json for MCP tools (defaults to repo root .mcp.json)")
 @click.option("--profile", default=None, help="Databricks config profile (uses saved config if omitted)")
 @click.option("--catalog", default=None, help="Unity Catalog override")
 @click.option("--schema", default=None, help="Schema override")
@@ -229,16 +253,23 @@ def evaluate(
     suggest_improvements: bool,
     compare_baseline: str,
 ):
-    """Run evaluation on a skill directory."""
+    """Run evaluation on a skill directory.
+
+    SKILL_DIR can be a name (resolved from skills/) or a path.
+    """
     from .auth import WorkspaceConfig, load_config, authenticate, AuthError
     from .mcp_resolver import MCPConfig
     from .orchestrator import EvaluationSuiteConfig, run_evaluation_suite
+    from .paths import resolve_skill_dir, DEFAULT_MCP_JSON
     from .skill_discovery import SkillDescriptor, SkillDiscoveryError
     from .test_instructions import SkillTestInstructions
 
+    # Resolve skill directory (name or path)
+    resolved_dir = resolve_skill_dir(skill_dir)
+
     # Parse skill
     try:
-        skill = SkillDescriptor.from_directory(Path(skill_dir))
+        skill = SkillDescriptor.from_directory(resolved_dir)
     except SkillDiscoveryError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -270,18 +301,20 @@ def evaluate(
     if experiment:
         ws_config.experiment_path = experiment
 
-    # Load MCP config
+    # Load MCP config (explicit > repo root default > auto-discover)
     mcp_config = None
     if mcp_json:
         mcp_config = MCPConfig.from_mcp_json(Path(mcp_json))
+    elif DEFAULT_MCP_JSON.exists():
+        mcp_config = MCPConfig.from_mcp_json(DEFAULT_MCP_JSON)
     else:
-        mcp_config = MCPConfig.auto_discover(Path(skill_dir))
+        mcp_config = MCPConfig.auto_discover(resolved_dir)
 
     if mcp_config:
         mcp_config.resolve_available_tools()
 
     # Load test instructions
-    test_instructions = SkillTestInstructions.from_skill_dir(Path(skill_dir))
+    test_instructions = SkillTestInstructions.from_skill_dir(resolved_dir)
 
     # Parse levels
     level_list = [l.strip() for l in levels.split(",")]
@@ -329,7 +362,7 @@ def evaluate(
         click.echo(f"\nMLflow run: {result.mlflow_run_id}")
 
     # Check if report was generated
-    report_path = Path(skill_dir) / "eval" / "report.html"
+    report_path = resolved_dir / "eval" / "report.html"
     if report_path.exists():
         click.echo(f"HTML report: {report_path}")
 

@@ -1,297 +1,303 @@
 # databricks-skill-evaluator
 
-Evaluate and optimize [Claude Code skills](https://docs.anthropic.com/en/docs/agents-and-tools/agent-skills) against real Databricks workspaces. Point it at any skill directory and get comprehensive evaluation across 5 levels, with results logged to Databricks MLflow.
+Evaluate and optimize [Claude Code skills](https://docs.anthropic.com/en/docs/agents-and-tools/agent-skills) against real Databricks workspaces. Tests whether a skill actually improves agent behavior using a 5-level testing pyramid, with results logged to Databricks MLflow.
 
-## Why
+## Directory Structure
 
-Claude Code skills are markdown files that teach the agent domain-specific knowledge. But how do you know if a skill actually helps? Does the agent produce better results with it than without it? Are the code examples correct? Do the tool references point at real tools?
+This repo uses a standard layout. Everything has a designated place:
 
-This framework answers those questions with a 5-level testing pyramid:
+```
+databricks-skill-evaluator/
+  skills/                        # YOUR SKILLS GO HERE
+    my-skill/                    # Each skill is its own folder
+      SKILL.md                   # Required: the skill file
+      *.md                       # Optional: reference files
+      eval/                      # Created by `dse init` (test config)
+  mcps/                          # MCP SERVER REPOS GO HERE
+    databricks-mcp-server/       # Clone MCP server repos into this folder
+    databricks-tools-core/       # Supporting libraries go here too
+  .mcp.json                      # MCP config (points to mcps/)
+  src/skill_evaluator/           # Framework source (don't modify)
+  skill-example/                 # Reference template (read-only)
+```
 
-| Level | Name | What It Tests | Needs Agent? |
-|-------|------|---------------|-------------|
-| L1 | **Unit Tests** | Code block syntax, broken links, YAML validity | No |
-| L2 | **Integration Tests** | End-to-end workflows against real Databricks | Yes |
-| L3 | **Static Eval** | SKILL.md quality (10 criteria via LLM judge) | No |
-| L4 | **Thinking Eval** | Agent reasoning: efficiency, clarity, recovery | Yes |
-| L5 | **Output Eval** | WITH vs WITHOUT skill comparison | Yes |
+**Rules:**
+- Put skills in `skills/`. One folder per skill. Each must contain a `SKILL.md`.
+- Put MCP server repos in `mcps/`. The `.mcp.json` at the repo root references them.
+- Don't create subfolders inside `skills/my-skill/` except `eval/` (created by `dse init`).
+- Don't put skills or MCP repos anywhere else in the repo.
 
-L1 and L3 run in seconds with zero agent cost. L2/L4/L5 run real Claude Code agents and compare behavior with and without the skill.
+## Setup (Step by Step)
 
-## Install
+### Step 1: Clone and install
 
 ```bash
-pip install databricks-skill-evaluator
+git clone <this-repo-url>
+cd databricks-skill-evaluator
+pip install -e .
 ```
 
-## Quick Start
+Verify the CLI is installed:
 
 ```bash
-# 1. Authenticate with your Databricks workspace
-dse auth --profile my-workspace --catalog main --schema skill_test
-
-# 2. Initialize eval config for your skill (creates templates with TODOs)
-dse init ./my-skill
-
-# 3. *** YOU WRITE YOUR TEST CASES ***
-#    Edit eval/ground_truth.yaml — prompts, expected facts, assertions
-#    Edit eval/thinking_instructions.md — what good reasoning looks like
-#    Edit eval/output_instructions.md — what correct output looks like
-
-# 4. Run evaluation
-dse evaluate ./my-skill --levels unit,static              # Quick (seconds)
-dse evaluate ./my-skill --levels all --mcp-json .mcp.json  # Full (minutes)
-
-# 5. Review report.html, export feedback.json
-
-# 6. Optimize based on results
-dse optimize ./my-skill --feedback eval/feedback.json --preset quick
+dse --help
 ```
 
-## What You Provide
+### Step 2: Set up MCP servers (required for agent-based evaluation)
 
-The framework provides structure, scoring, and tooling. **You** provide the skill and write the evaluation criteria. No test cases are auto-generated — you define what "good" looks like for your specific skill.
+If your skill uses MCP tools (e.g., Databricks tools like `create_or_update_genie`), you need the MCP server installed. Clone the repos into `mcps/`:
 
-### 1. Your skill directory
+```bash
+# Clone into the mcps/ directory (NOT the repo root)
+git clone <databricks-mcp-server-url> mcps/databricks-mcp-server
+git clone <databricks-tools-core-url> mcps/databricks-tools-core
 
-A directory with a `SKILL.md` (and optional reference files):
-
+# Install them
+./setup.sh --with-mcp
 ```
-my-skill/
-  SKILL.md              # Required: frontmatter (name, description) + instructions
-  reference.md          # Optional: additional reference files
+
+This installs the MCP server packages so the evaluator can spawn agents that call MCP tools.
+
+**If your skill does NOT use MCP tools**, skip this step entirely.
+
+### Step 3: Authenticate with Databricks
+
+```bash
+dse auth --profile <your-databricks-profile> --catalog main --schema skill_test
 ```
 
-The `SKILL.md` must have YAML frontmatter:
+This saves your workspace config to `~/.dse/config.yaml`. The `--profile` must match a profile in your `~/.databrickscfg` file.
+
+If you don't have a Databricks profile yet:
+
+```bash
+databricks auth login --host https://your-workspace.cloud.databricks.com
+```
+
+### Step 4: Add your skill
+
+Copy your skill folder into `skills/`:
+
+```bash
+cp -r /path/to/my-skill skills/my-skill
+```
+
+Your skill folder must contain a `SKILL.md` with YAML frontmatter:
 
 ```yaml
 ---
 name: my-skill
 description: "What this skill does and when to use it"
 ---
+
+# My Skill
+
+Instructions for the agent...
 ```
 
-### 2. Your evaluation config (created by `dse init`, written by you)
+Verify it's detected:
 
-```
-my-skill/
-  eval/                 # Created by `dse init` with TODO templates
-    ground_truth.yaml   # YOU write: test cases with prompts, expected facts, assertions
-    manifest.yaml       # YOU configure: scorers, quality gates, trace expectations
-    thinking_instructions.md  # YOU write: what good reasoning looks like for your skill
-    output_instructions.md    # YOU write: what correct output looks like
-    source_of_truth/          # YOU add: expected output files for comparison
+```bash
+dse list
 ```
 
-`dse init` creates these files with placeholder TODOs. You fill them in based on your domain expertise. See the [skill-example/](skill-example/) directory for a ready-to-copy template with annotated files showing how to structure your skill folder, write ground truth, and configure evaluation. For a full end-to-end walkthrough using a real skill, see [example.md](example.md).
+You should see:
+
+```
+Available skills:
+  my-skill                       [needs init]
+```
+
+### Step 5: Initialize evaluation config
+
+```bash
+dse init my-skill
+```
+
+This creates `skills/my-skill/eval/` with template files:
+
+```
+skills/my-skill/eval/
+  ground_truth.yaml           # Test cases — prompts + expected outputs
+  manifest.yaml               # Scorer config
+  thinking_instructions.md    # What good reasoning looks like
+  output_instructions.md      # What correct output looks like
+```
+
+### Step 6: Write your test cases
+
+Open `skills/my-skill/eval/ground_truth.yaml` and replace the TODO placeholders with real test cases:
+
+```yaml
+test_cases:
+  - id: basic_usage
+    inputs:
+      prompt: "Create a dashboard showing sales by region"
+    expectations:
+      expected_facts:
+        - "sales"
+        - "region"
+      assertions:
+        - "The agent creates a dashboard with regional sales data"
+      expected_patterns:
+        - pattern: "create_or_update_dashboard"
+          min_count: 1
+          description: "Must call the create dashboard tool"
+      trace_expectations:
+        required_tools:
+          - mcp__databricks__create_or_update_dashboard
+```
+
+Also edit:
+- `thinking_instructions.md` — describe what good reasoning looks like for your skill
+- `output_instructions.md` — describe what correct output looks like
+
+See [skill-example/](skill-example/) for a complete annotated template.
+
+### Step 7: Run evaluation
+
+**Quick eval** (seconds, no agent needed):
+
+```bash
+dse evaluate my-skill --levels unit,static
+```
+
+**Full eval** (minutes, runs real Claude agents against Databricks):
+
+```bash
+dse evaluate my-skill --levels all
+```
+
+You don't need `--mcp-json` — the evaluator automatically uses the `.mcp.json` at the repo root.
+
+### Step 8: Review results
+
+Every evaluation generates:
+- `skills/my-skill/eval/report.html` — visual report with per-check details
+- `skills/my-skill/eval/evaluation_results.json` — machine-readable results
+- An MLflow run in your configured experiment
 
 ## Evaluation Levels
 
+Levels run in cost order. L1 and L3 are fast gates; L2/L4/L5 are agent-based.
+
+| Level | Name | What It Tests | Needs Agent? | Time |
+|-------|------|---------------|-------------|------|
+| L1 | **Unit Tests** | Code syntax, broken links, YAML validity | No | Seconds |
+| L3 | **Static Eval** | SKILL.md quality (10 criteria via LLM judge) | No | ~30s |
+| L2 | **Integration** | End-to-end MCP tool calls against Databricks | Yes | Minutes |
+| L4 | **Thinking** | Agent reasoning: efficiency, clarity, recovery | Yes | Minutes |
+| L5 | **Output** | WITH vs WITHOUT skill comparison | Yes | Minutes |
+
 ### L1: Unit Tests
 
-Extracts every fenced code block from the skill's markdown files and validates syntax:
-- Python blocks parsed with `ast.parse()`
-- SQL blocks checked for balanced parentheses and structure
-- YAML blocks validated with `yaml.safe_load()`
-- Relative links between `.md` files verified
-
-Zero LLM cost. Catches broken examples before they confuse the agent.
+Extracts every fenced code block from the skill's markdown files and validates syntax. Python blocks parsed with `ast.parse()`, SQL checked for structure, YAML validated with `yaml.safe_load()`, relative links verified. Zero LLM cost.
 
 ### L2: Integration Tests
 
-Runs the real Claude Code agent against your Databricks workspace:
-- Tests MCP tool connectivity
-- Executes test cases from `ground_truth.yaml`
-- Validates tool call success rates
-- Checks trace expectations (required tools, banned tools, call limits)
+Runs the real Claude Code agent against your Databricks workspace. Tests MCP tool connectivity, executes test cases from `ground_truth.yaml`, validates tool call success rates, and checks trace expectations.
 
 ### L3: Static Eval
 
-An LLM judge evaluates the SKILL.md document itself across 10 quality dimensions:
-
-1. Self-contained
-2. No conflicting information
-3. Security (no hardcoded secrets)
-4. LLM-navigable structure
-5. Actionable instructions
-6. Scoped clearly
-7. Tool/CLI accuracy (deterministic: cross-references MCP tools)
-8. Examples valid (deterministic: syntax checks)
-9. Error handling guidance
-10. No hallucination triggers
-
-Deterministic checks run first at zero cost. Semantic dimensions use 1 batched LLM call.
+An LLM judge evaluates the SKILL.md across 10 quality dimensions: self-contained, no conflicts, security, LLM-navigable structure, actionable instructions, scoped clearly, tool accuracy, examples valid, error handling, no hallucination triggers.
 
 ### L4: Thinking Eval
 
-Evaluates HOW the agent reasons, not what it produces:
-- **Efficiency**: Did it use minimum necessary tool calls?
-- **Clarity**: Did it show confusion or backtracking?
-- **Recovery**: How did it handle errors?
-- **Completeness**: Did it finish all required steps?
+Evaluates HOW the agent reasons: efficiency (minimum tool calls?), clarity (confusion or backtracking?), recovery (error handling?), completeness (all steps finished?).
 
-Uses custom `thinking_instructions.md` that you write for your skill's specific workflows.
+### L5: Output Eval (WITH vs WITHOUT)
 
-### L5: Output Eval
+The core controlled experiment. Each test case runs WITH the skill and WITHOUT it, then assertions are classified:
 
-The core controlled experiment. For each test case:
-1. Run agent **WITH** the skill
-2. Run agent **WITHOUT** the skill (cached baseline)
-3. Grade both responses with the semantic grader
-4. Classify each assertion: POSITIVE / REGRESSION / NEEDS_SKILL / NEUTRAL
-
-Score formula: 40% effectiveness delta + 30% pass rate + 15% token efficiency + 5% structure - 10% regression penalty.
-
-## MLflow Integration
-
-All results are logged to Databricks MLflow:
-
-```
-Experiment: /Users/you@databricks.com/GenAI/skill-evals
-  Run: my-skill_eval_20260401
-    Tags: skill_name, eval_type, levels, framework_version
-    Metrics: composite_score, per-level scores, per-dimension scores
-    Artifacts: evaluation.json, report.html
-```
-
-Compare runs across branches, track quality over time, and drill into per-task metrics directly in the Databricks workspace UI.
-
-## HTML Report
-
-Every evaluation generates a self-contained HTML report at `eval/report.html`:
-- Summary dashboard with composite score
-- Per-level cards showing every check with pass/fail
-- Feedback form with export to `feedback.json` for optimization
-
-## Optimization
-
-Uses [GEPA](https://github.com/gepa-ai/gepa) (Generalized Evolutionary Prompt Architect) to iteratively improve the SKILL.md:
-
-```bash
-dse optimize ./my-skill --feedback eval/feedback.json --preset quick --apply
-```
-
-| Preset | Iterations | Time |
-|--------|-----------|------|
-| `minimal` | ~3 | ~2 min |
-| `quick` | ~15 | ~10 min |
-| `standard` | ~50 | ~30 min |
-| `thorough` | ~150 | ~90 min |
-
-The optimizer reads human feedback, runs mutations, evaluates each candidate with the WITH/WITHOUT comparison, and selects the best from a Pareto frontier.
+- **POSITIVE**: WITH passes, WITHOUT fails — skill taught something useful
+- **REGRESSION**: WITH fails, WITHOUT passes — skill confused the agent
+- **NEEDS_SKILL**: Both fail — skill doesn't cover this yet
+- **NEUTRAL**: Both pass — agent already knows this
 
 ## CLI Reference
 
-```
-dse auth       Authenticate with Databricks and save config
-dse init       Initialize eval/ config for a skill directory
-dse evaluate   Run evaluation (--levels unit,static,integration,thinking,output,all)
-dse optimize   Run GEPA optimization (--preset minimal|quick|standard|thorough)
+```bash
+dse list                                    # Show available skills
+dse auth --profile <name>                   # Authenticate with Databricks
+dse init <skill>                            # Create eval config templates
+dse evaluate <skill> --levels <levels>      # Run evaluation
+dse optimize <skill> --preset <preset>      # Optimize SKILL.md (GEPA)
+dse setup --profile <name>                  # Register MCP server in Claude Code
 ```
 
-Key flags for `dse evaluate`:
+`<skill>` can be a name (looked up in `skills/`) or a path (e.g., `./my-skill`).
 
-| Flag | Purpose |
-|------|---------|
-| `--levels` | Comma-separated levels to run (default: `unit,static`) |
-| `--mcp-json` | Path to `.mcp.json` for MCP tool access |
-| `--profile` | Databricks config profile |
-| `--experiment` | MLflow experiment path |
-| `--agent-model` | Claude model override |
-| `--suggest-improvements` | Generate actionable improvement suggestions |
-| `--compare-baseline` | MLflow run ID to compare against |
+### Key flags for `dse evaluate`
 
-## Architecture
+| Flag | Purpose | Default |
+|------|---------|---------|
+| `--levels` | Comma-separated: unit, static, integration, thinking, output, all | `unit,static` |
+| `--mcp-json` | Path to `.mcp.json` | Repo root `.mcp.json` |
+| `--profile` | Databricks config profile | Saved config |
+| `--experiment` | MLflow experiment path | `/Shared/skill-evals` |
+| `--agent-model` | Claude model override | Default |
+| `--agent-timeout` | Agent timeout in seconds | No timeout |
+| `--suggest-improvements` | Generate improvement suggestions | Off |
+| `--compare-baseline` | MLflow run ID to compare against | None |
 
-```
-  dse auth | init | evaluate | optimize
-          │
-          ▼
-    Orchestrator
-    (runs levels sequentially)
-          │
-          ▼
-  ┌─────────────────────────────────┐
-  │       5 Evaluation Levels       │
-  │                                 │
-  │  L1 Unit ─── syntax, links     │
-  │  L2 Integration ── agent + ws  │
-  │  L3 Static ── LLM judge        │
-  │  L4 Thinking ── trace quality  │
-  │  L5 Output ── WITH/WITHOUT     │
-  └──────────────┬──────────────────┘
-                 │
-  ┌──────────────▼──────────────────┐
-  │     Shared Infrastructure       │
-  │                                 │
-  │  Semantic Grader (3-phase)      │
-  │  Claude Agent SDK (executor.py) │
-  │  Deterministic Scorers          │
-  │  LLM Backend (model fallback)   │
-  │  MLflow Tracing + Assessments   │
-  │  HTML Report Generator          │
-  └─────────────────────────────────┘
-```
+## Iterative Improvement
+
+1. **Run eval** — review the HTML report
+2. **Read failure rationales** — each feedback explains WHY it failed
+3. **Fix the SKILL.md** — use rationales to make targeted edits
+4. **Rerun** — verify improvements
+5. **Compare in MLflow** — track scores across runs
+
+Write your `ground_truth.yaml` assertions BEFORE polishing the skill. The assertions define the specification. Then iterate on the SKILL.md until the judges pass.
+
+## Scoring
+
+| Level | Pass Threshold | Formula |
+|-------|---------------|---------|
+| L1: Unit | >= 50% | passed_checks / total_checks |
+| L2: Integration | >= 50% | successful_tests / total_tests |
+| L3: Static | >= 50% | (mean_dimension / 10) * coverage_factor |
+| L4: Thinking | >= 50% | mean(dimension_scores) / 5 |
+| L5: Output | >= 50% | 50% response + 30% assets + 20% source_of_truth |
+| Composite | — | mean(all level scores) |
+
+## Troubleshooting
+
+| Error | Fix |
+|-------|-----|
+| `dse: command not found` | Run `pip install -e .` from the repo root |
+| "No ~/.databrickscfg found" | Run `databricks auth login --host <URL>` |
+| "Profile not found" | Check `~/.databrickscfg` for available profile names |
+| "No SKILL.md found" | Make sure your skill folder has a `SKILL.md` at the top level |
+| "No test cases in ground_truth.yaml" | Run `dse init <skill>`, then fill in the TODOs |
+| "No such tool available: mcp__*" | MCP server not installed. Run `./setup.sh --with-mcp` |
+| `dse list` shows nothing | Copy your skill folder into `skills/` |
+| Agent timeout | Increase `--agent-timeout` or simplify test cases |
 
 ## Project Structure
 
 ```
-databricks-skill-evaluator/
-  SKILL.md                     # Claude Code skill (teaches evaluation workflow)
-  pyproject.toml               # pip install, dse entry point
-  README.md                    # This file
-  TECHNICAL.md                 # Deep dive into internals
-  example.md                   # End-to-end walkthrough with databricks-genie
-  src/skill_evaluator/
-    cli.py                     # Click CLI — dse command
-    orchestrator.py            # Suite runner
-    auth.py                    # Databricks auth + ~/.dse/config.yaml
-    skill_discovery.py         # Parse SKILL.md frontmatter + references
-    mcp_resolver.py            # Resolve .mcp.json for agent execution
-    test_instructions.py       # Load eval/ config (ground_truth, instructions)
-    core/
-      config.py                # EvaluatorConfig, QualityGates, MLflowConfig
-      dataset.py               # EvalRecord, YAMLDatasetSource
-      trace_models.py          # TraceMetrics, ToolCall, FileOperation
-    levels/
-      base.py                  # EvalLevel ABC, LevelConfig, LevelResult
-      unit_tests.py            # L1: code block syntax validation
-      integration_tests.py     # L2: real agent + Databricks workspace
-      static_eval.py           # L3: LLM judge, 10 criteria, 1-10 scale
-      thinking_eval.py         # L4: agent reasoning quality
-      output_eval.py           # L5: WITH/WITHOUT comparison
-      agent_evaluator.py       # Agent execution wrapper for GEPA
-    grading/
-      semantic_grader.py       # 3-phase grading (deterministic → agent → LLM)
-      llm_backend.py           # completion_with_fallback, model fallback chain
-    scorers/
-      deterministic.py         # python_syntax, sql_syntax, pattern_adherence
-      trace.py                 # tool_count, required_tools, banned_tools
-      llm_judges.py            # LLM-based dynamic scorers
-    optimize/
-      config.py                # GEPA presets (minimal/quick/standard/thorough)
-      feedback.py              # Human feedback → GEPA background
-      splitter.py              # Train/val dataset splitting
-      utils.py                 # Token counting, path resolution
-    reporting/
-      html_report.py           # Self-contained HTML report generator
-    criteria/
-      eval_criteria.py         # SkillSet/Skill parsing for eval rubrics
-      builtin/                 # Shipped evaluation criteria
-        general-quality/       # Response quality rubric
-        sql-correctness/       # SQL best practices rubric
-        tool-selection/        # MCP tool preference rubric
+src/skill_evaluator/
+  cli.py                     # Click CLI (dse command)
+  paths.py                   # Standard directory paths (skills/, mcps/)
+  orchestrator.py            # Suite runner
+  auth.py                    # Databricks auth + ~/.dse/config.yaml
+  skill_discovery.py         # Parse SKILL.md frontmatter + references
+  mcp_resolver.py            # Resolve .mcp.json for agent execution
+  test_instructions.py       # Load eval/ config
+  core/                      # Config, dataset, trace models
+  levels/                    # L1-L5 evaluation implementations
+  grading/                   # Semantic grader, LLM backend
+  scorers/                   # Deterministic + LLM-based scorers
+  optimize/                  # GEPA optimization
+  reporting/                 # HTML report generator
 ```
 
-## Setting Up a Skill for Evaluation
+## Full Documentation
 
-Start with the [skill-example/](skill-example/) directory — it contains a ready-to-copy template with annotated versions of every required file. The [skill-example/README.md](skill-example/README.md) explains the folder structure, what goes inside vs. outside the skill directory, and how to write your first test cases.
-
-## Full Walkthrough
-
-See [example.md](example.md) for a complete step-by-step walkthrough using the `databricks-genie` skill.
-
-See [TECHNICAL.md](TECHNICAL.md) for implementation details — how each level works internally, the semantic grading pipeline, scoring formulas, and MLflow integration.
+- [skill-example/](skill-example/) — Ready-to-copy template with annotated files
+- [example.md](example.md) — End-to-end walkthrough with the databricks-genie skill
+- [TECHNICAL.md](TECHNICAL.md) — Deep dive into scoring formulas, grading pipeline, MLflow integration
 
 ## License
 

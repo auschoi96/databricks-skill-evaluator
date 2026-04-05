@@ -31,7 +31,7 @@ The `.mcp.json` may reference a `.venv/bin/python` that doesn't exist locally. T
 
 This installs `databricks-tools-core` and `databricks-mcp-server` (must be cloned into the repo root first). Without this, agent-based levels will fail with "No such tool available" errors.
 
-**Not every skill requires MCP tools.** If the skill being evaluated doesn't reference MCP tools, skip this step and omit `--mcp-json` from `dse evaluate` commands.
+**Not every skill requires MCP tools.** If the skill being evaluated doesn't reference MCP tools, skip the MCP setup step.
 
 ---
 
@@ -76,27 +76,24 @@ Options: `--warehouse-id <id>`, `--experiment /Shared/skill-evals`.
 
 ## Phase 1: Discover the Skill and its MCP Tools
 
-Ask the user for:
-1. **Skill directory path** — the directory containing SKILL.md
-2. **MCP tools location** — which `.mcp.json` has the MCP servers the skill needs (e.g., the Databricks MCP server). The skill being evaluated likely references MCP tools it doesn't define itself. Ask: "Where is the `.mcp.json` that defines the MCP tools this skill uses?" Common locations:
-   - The parent project's `.mcp.json`
-   - `~/.claude.json` (user's global Claude Code config)
-   - A specific path the user provides
+Ask the user for the **skill name or directory path**. Skills should be in the `skills/` directory. If the user gives a name like "databricks-genie", it resolves to `skills/databricks-genie`. If they give a path, use it directly.
+
+The MCP config is automatically loaded from the repo root `.mcp.json` — no need to ask for it unless the user has a custom location.
 
 Run:
 
 ```bash
-dse init <skill_dir>
+dse init <skill_name>
 ```
 
 This discovers the skill and scaffolds eval templates if missing.
 
-**GATE — MCP config check**: If the user provided an `.mcp.json` path:
-1. Verify the file exists.
+**GATE — MCP config check**: If the skill references MCP tools:
+1. Verify `.mcp.json` exists at the repo root.
 2. Check that the MCP server packages are installed by running: `python -c "import databricks_mcp_server"` (or the relevant server package). If the import fails, tell the user to run `./setup.sh --with-mcp`.
-3. Pass `--mcp-json <path>` to all subsequent `dse evaluate` commands. Without this, agent-based levels (L2/L4/L5) will have no MCP tools and fail.
+3. The evaluator automatically uses the repo root `.mcp.json` — no `--mcp-json` flag needed.
 
-If the skill does NOT reference MCP tools, skip this gate entirely — `--mcp-json` is not needed.
+If the skill does NOT reference MCP tools, skip this gate entirely.
 
 **GATE — eval config check**: If `eval/ground_truth.yaml` doesn't exist or contains only TODOs, STOP and tell the user:
 
@@ -116,7 +113,7 @@ If eval config is ready, proceed to Phase 2.
 Run unit tests and static eval together — these are fast and don't require an agent:
 
 ```bash
-dse evaluate <skill_dir> --levels unit,static
+dse evaluate <skill_name> --levels unit,static
 ```
 
 **Parse the output** for L1 and L3 scores. Present:
@@ -134,20 +131,20 @@ dse evaluate <skill_dir> --levels unit,static
 
 ## Phase 3: Agent Eval (L2 + L4 + L5)
 
-**IMPORTANT**: Always pass `--mcp-json <path>` from Phase 1. Without it, the spawned agent has no MCP tools.
+The evaluator automatically uses the repo root `.mcp.json` — no `--mcp-json` flag needed.
 
 Run all agent-based levels:
 
 ```bash
-dse evaluate <skill_dir> --levels integration,thinking,output --mcp-json <path> --agent-timeout 300
+dse evaluate <skill_name> --levels integration,thinking,output --agent-timeout 300
 ```
 
 Or run individual levels if the user asked for a specific one:
 
 ```bash
-dse evaluate <skill_dir> --levels integration --mcp-json <path>
-dse evaluate <skill_dir> --levels thinking --mcp-json <path>
-dse evaluate <skill_dir> --levels output --mcp-json <path>
+dse evaluate <skill_name> --levels integration
+dse evaluate <skill_name> --levels thinking
+dse evaluate <skill_name> --levels output
 ```
 
 Optional flags: `--agent-model <model>`, `--agent-timeout <seconds>`, `--judge-model <model>`.
@@ -177,7 +174,7 @@ Score weighted: 50% response quality + 30% asset verification + 20% source-of-tr
 
 ## Phase 4: Report & Summary
 
-After running levels, an HTML report is generated at `<skill_dir>/eval/report.html`. Present:
+After running levels, an HTML report is generated at `skills/<skill_name>/eval/report.html`. Present:
 
 ```
 ## Evaluation Complete
@@ -209,7 +206,7 @@ After running levels, an HTML report is generated at `<skill_dir>/eval/report.ht
 To run everything in one shot:
 
 ```bash
-dse evaluate <skill_dir> --levels all --mcp-json <path> --suggest-improvements
+dse evaluate <skill_name> --levels all --suggest-improvements
 ```
 
 Add `--experiment /Shared/skill-evals` to log to MLflow. Add `--compare-baseline <run_id>` to compare against a previous run.

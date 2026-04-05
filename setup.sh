@@ -13,8 +13,10 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MCP_SERVER_DIR="${SCRIPT_DIR}/databricks-mcp-server"
-TOOLS_CORE_DIR="${SCRIPT_DIR}/databricks-tools-core"
+SKILLS_DIR="${SCRIPT_DIR}/skills"
+MCPS_DIR="${SCRIPT_DIR}/mcps"
+MCP_SERVER_DIR="${MCPS_DIR}/databricks-mcp-server"
+TOOLS_CORE_DIR="${MCPS_DIR}/databricks-tools-core"
 
 echo "======================================"
 echo "Databricks Skill Evaluator Setup"
@@ -38,13 +40,15 @@ if [[ "$1" == "--with-mcp" ]]; then
 
     if [ ! -d "$MCP_SERVER_DIR" ]; then
         echo "Error: databricks-mcp-server not found at $MCP_SERVER_DIR"
-        echo "Clone it into the project root first."
+        echo "Clone it into mcps/ first:"
+        echo "  git clone <repo-url> $MCP_SERVER_DIR"
         exit 1
     fi
 
     if [ ! -d "$TOOLS_CORE_DIR" ]; then
         echo "Error: databricks-tools-core not found at $TOOLS_CORE_DIR"
-        echo "Clone it into the project root first."
+        echo "Clone it into mcps/ first:"
+        echo "  git clone <repo-url> $TOOLS_CORE_DIR"
         exit 1
     fi
 

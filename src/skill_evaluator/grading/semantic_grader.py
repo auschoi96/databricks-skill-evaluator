@@ -49,9 +49,16 @@ class AssertionResult:
 # ---------------------------------------------------------------------------
 
 
-def _check_patterns(response: str, expected_patterns: list) -> list[AssertionResult]:
-    """Check regex patterns deterministically. Zero LLM cost."""
+def _check_patterns(response: str, expected_patterns: list, transcript_text: str = "") -> list[AssertionResult]:
+    """Check regex patterns deterministically. Zero LLM cost.
+
+    Searches both the response text and the execution transcript so that
+    tool-call patterns (e.g. ``create_or_update_genie``) are found even
+    when the tool name only appears in the transcript as
+    ``mcp__databricks__create_or_update_genie``.
+    """
     results = []
+    search_text = response + "\n" + transcript_text if transcript_text else response
     for pattern_spec in expected_patterns:
         if isinstance(pattern_spec, str):
             pattern = pattern_spec
@@ -64,7 +71,7 @@ def _check_patterns(response: str, expected_patterns: list) -> list[AssertionRes
             max_count = pattern_spec.get("max_count", None)
             description = pattern_spec.get("description", pattern[:60])
 
-        matches = len(re.findall(pattern, response, re.IGNORECASE))
+        matches = len(re.findall(pattern, search_text, re.IGNORECASE))
 
         if max_count is not None:
             passed = min_count <= matches <= max_count
@@ -398,8 +405,9 @@ def grade_assertions(
     """
     all_results: list[AssertionResult] = []
 
-    # Step 1: Deterministic pattern checks (zero cost)
-    pattern_results = _check_patterns(response, expected_patterns or [])
+    # Step 1: Deterministic pattern checks (zero cost, searches response + transcript)
+    transcript_text = _format_transcript(transcript) if transcript else ""
+    pattern_results = _check_patterns(response, expected_patterns or [], transcript_text=transcript_text)
     all_results.extend(pattern_results)
 
     # Step 2: Deterministic fact checks (zero cost)
@@ -413,6 +421,11 @@ def grade_assertions(
     failed_facts = [r for r in fact_results if not r.passed]
     for r in failed_facts:
         semantic_items.append(f"The response mentions or explains: {r.text}")
+
+    # 3a-bis: Failed patterns also get a second chance via semantic grading
+    failed_patterns = [r for r in pattern_results if not r.passed]
+    for r in failed_patterns:
+        semantic_items.append(f"The agent called or used a tool matching this pattern: {r.text}")
 
     # 3b: Freeform assertions
     if assertions:
@@ -435,14 +448,22 @@ def grade_assertions(
         fact_upgrade_count = len(failed_facts)
         for i, sr in enumerate(semantic_results[:fact_upgrade_count]):
             if sr.passed:
-                # Find the original fact result and upgrade it
                 original_fact = failed_facts[i]
                 original_fact.passed = True
                 original_fact.evidence = f"Semantic match: {sr.evidence}"
                 original_fact.method = "semantic"
 
+        # Upgrade deterministic pattern failures that pass semantic grading
+        pattern_upgrade_count = len(failed_patterns)
+        pattern_start = fact_upgrade_count
+        for i, sr in enumerate(semantic_results[pattern_start:pattern_start + pattern_upgrade_count]):
+            if sr.passed:
+                failed_patterns[i].passed = True
+                failed_patterns[i].evidence = f"Semantic match: {sr.evidence}"
+                failed_patterns[i].method = "semantic"
+
         # Add freeform assertion results
-        freeform_start = fact_upgrade_count
+        freeform_start = fact_upgrade_count + pattern_upgrade_count
         freeform_end = freeform_start + len(assertions or [])
         for sr in semantic_results[freeform_start:freeform_end]:
             all_results.append(sr)
@@ -523,8 +544,9 @@ def grade_with_without(
 
     # Grade WITHOUT-skill response
     # Deterministic checks first (zero cost)
+    without_transcript_text = _format_transcript(without_transcript) if without_transcript else ""
     without_results_deterministic = (
-        _check_patterns(without_response, expected_patterns)
+        _check_patterns(without_response, expected_patterns, transcript_text=without_transcript_text)
         + _check_facts(without_response, expected_facts)
     )
 
