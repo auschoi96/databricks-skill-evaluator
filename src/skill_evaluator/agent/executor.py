@@ -477,27 +477,16 @@ def _get_mlflow_stop_hook(
                     )
                     return None
 
-            # Disable the MlflowV3SpanExporter in the parent process.
-            # process_transcript() creates spans that trigger the exporter,
-            # which tries to upload trace artifacts to S3 via presigned URLs.
-            # If the experiment's artifact_location is under .jobs/ DBFS,
-            # those URLs are not writable from outside the workspace (403).
-            # Tracing is only for observability -- the evaluation pipeline
-            # does not depend on it.
-            mlflow.tracing.disable()
-
             print(f"    [MLflow] Tracing configured: uri={tracking_uri} experiment={experiment_name}")
             _mlflow_env_configured = True
 
     async def _upload_trace_background(session_id, transcript_path):
-        """Upload transcript to MLflow in the background (best-effort).
+        """Upload transcript to MLflow as a trace (best-effort).
 
         Judges are field-based and don't consume MLflow traces, so this is
-        purely for observability logging.  Enabled by default.  The parent
-        process disables the MlflowV3SpanExporter (mlflow.tracing.disable)
-        to avoid S3 presigned-URL 403 errors; the exporter logger is also
-        suppressed during process_transcript() so any residual failures are
-        silent.
+        purely for observability logging.  Enabled by default.  The exporter
+        logger is suppressed during process_transcript() so any artifact-upload
+        warnings (e.g. S3 presigned-URL 403) are silent.
 
         Set SKILL_TEST_UPLOAD_TRACES=false to disable.
         """
@@ -543,18 +532,18 @@ def _get_mlflow_stop_hook(
             _exporter_logger.setLevel(_prev_level)
 
     async def mlflow_stop_hook(input_data, tool_use_id, context):
-        """Fire-and-forget transcript upload when agent stops.
+        """Upload transcript as MLflow trace when agent stops.
 
-        Launches background task and returns immediately so the agent
-        result is available for scoring without waiting on MLflow I/O.
+        Awaits the upload so it completes before the event loop shuts down
+        (the fresh-loop cleanup cancels pending tasks).  Matches the
+        synchronous pattern used by the builder app.
         """
         session_id = input_data.get("session_id")
         transcript_path = input_data.get("transcript_path")
 
         print(f"    [MLflow] Stop hook fired: session={session_id}, transcript={transcript_path}")
 
-        # Best-effort background upload -- don't block scoring pipeline
-        asyncio.ensure_future(_upload_trace_background(session_id, transcript_path))
+        await _upload_trace_background(session_id, transcript_path)
         return {"continue": True}
 
     return mlflow_stop_hook

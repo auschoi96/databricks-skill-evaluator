@@ -29,6 +29,7 @@ def _build_level_config(
     agent_model: Optional[str] = None,
     agent_timeout: int = 0,
     judge_model: Optional[str] = None,
+    experiment: Optional[str] = None,
 ):
     """Construct a LevelConfig from a skill directory and saved workspace config."""
     from .auth import load_config
@@ -47,6 +48,9 @@ def _build_level_config(
         ws_config = WorkspaceConfig(
             profile="DEFAULT", host="", catalog="main", schema="default",
         )
+
+    if experiment:
+        ws_config.experiment_path = experiment
 
     mcp_config = None
     if mcp_json_path:
@@ -253,6 +257,7 @@ async def run_integration_tests(
     mcp_json_path: Optional[str] = None,
     agent_model: Optional[str] = None,
     agent_timeout: int = 0,
+    experiment: Optional[str] = None,
 ) -> str:
     """Run Level 2 integration tests — end-to-end against real Databricks.
 
@@ -265,9 +270,10 @@ async def run_integration_tests(
         mcp_json_path: Path to .mcp.json with Databricks MCP server config (auto-discovered if omitted)
         agent_model: Claude model override for agent execution
         agent_timeout: Timeout in seconds per agent run (default: 300)
+        experiment: MLflow experiment path for trace logging (uses saved config if omitted)
     """
     try:
-        config = _build_level_config(skill_dir, mcp_json_path, agent_model, agent_timeout)
+        config = _build_level_config(skill_dir, mcp_json_path, agent_model, agent_timeout, experiment=experiment)
         from .levels.integration_tests import IntegrationTestLevel
         result = await asyncio.to_thread(IntegrationTestLevel().run, config)
         return _safe_json(result.to_dict())
@@ -285,6 +291,7 @@ async def run_thinking_eval(
     mcp_json_path: Optional[str] = None,
     agent_model: Optional[str] = None,
     agent_timeout: int = 0,
+    experiment: Optional[str] = None,
 ) -> str:
     """Run Level 4 thinking evaluation — assess agent reasoning quality.
 
@@ -299,9 +306,10 @@ async def run_thinking_eval(
         mcp_json_path: Path to .mcp.json with Databricks MCP server config
         agent_model: Claude model override for agent execution
         agent_timeout: Timeout in seconds per agent run (default: 300)
+        experiment: MLflow experiment path for trace logging (uses saved config if omitted)
     """
     try:
-        config = _build_level_config(skill_dir, mcp_json_path, agent_model, agent_timeout)
+        config = _build_level_config(skill_dir, mcp_json_path, agent_model, agent_timeout, experiment=experiment)
         from .levels.thinking_eval import ThinkingEvalLevel
         result = await asyncio.to_thread(ThinkingEvalLevel().run, config)
         return _safe_json(result.to_dict())
@@ -319,6 +327,7 @@ async def run_output_eval(
     mcp_json_path: Optional[str] = None,
     agent_model: Optional[str] = None,
     agent_timeout: int = 0,
+    experiment: Optional[str] = None,
 ) -> str:
     """Run Level 5 output evaluation — WITH vs WITHOUT skill comparison.
 
@@ -334,9 +343,10 @@ async def run_output_eval(
         mcp_json_path: Path to .mcp.json with Databricks MCP server config
         agent_model: Claude model override for agent execution
         agent_timeout: Timeout in seconds per agent run (default: 300)
+        experiment: MLflow experiment path for trace logging (uses saved config if omitted)
     """
     try:
-        config = _build_level_config(skill_dir, mcp_json_path, agent_model, agent_timeout)
+        config = _build_level_config(skill_dir, mcp_json_path, agent_model, agent_timeout, experiment=experiment)
         from .levels.output_eval import OutputEvalLevel
         result = await asyncio.to_thread(OutputEvalLevel().run, config)
         return _safe_json(result.to_dict())

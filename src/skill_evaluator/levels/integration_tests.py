@@ -98,6 +98,8 @@ class IntegrationTestLevel(EvalLevel):
                     mcp_config=config.mcp_config.servers if config.mcp_config else None,
                     timeout_seconds=config.agent_timeout,
                     model=config.agent_model,
+                    mlflow_experiment=config.workspace.experiment_path,
+                    skill_name=config.skill.name,
                 )
                 execution_time = time.time() - start_time
 
