@@ -25,6 +25,9 @@ venv/
 
 # External / vendored repos (local only)
 skillforge-main/
-databricks-genie/
-databricks-mcp-server/
-databricks-tools-core/
+
+# Standard directories (user content, not tracked)
+skills/*
+!skills/.gitkeep
+mcps/*
+!mcps/.gitkeep
